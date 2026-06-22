@@ -48,7 +48,7 @@ impl NodeKind {
 #[serde(rename_all = "snake_case")]
 pub enum EdgeKind {
     /// A script reads one symbol and writes another (read/write dependency).
-    /// Extraction is stubbed in this scaffold; see the loader's TODO.
+    /// Reads point into the backing function; writes point out of it.
     DataFlow,
     /// Links a table's input-axis symbols / output channel to the table node.
     TableAxis,

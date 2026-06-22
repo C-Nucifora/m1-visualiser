@@ -22,8 +22,9 @@
 //! the project's `*.m1scr` scripts (parsed once via `parse_all`), threading them
 //! into the model for the data-flow pass.
 //!
-//! `DataFlow` edges require per-script CST read/write analysis and are stubbed —
-//! see [`add_data_flow_edges`].
+//! - **DataFlow edges** from per-script read/write analysis ([`crate::dataflow`]):
+//!   each script's reads point into its backing function, its writes point out —
+//!   see [`add_data_flow_edges`].
 
 use crate::model::{EdgeKind, GraphEdge, GraphModel, GraphNode, NodeKind};
 use m1_typecheck::Project;
@@ -99,7 +100,7 @@ fn build_node(sym: &Symbol, kind: NodeKind) -> GraphNode {
 /// parameter **shape** (notably `table_meta`, which drives `table_dims`) reaches
 /// the graph. Scripts are discovered by walking the project file's parent
 /// directory recursively for `*.m1scr` and parsed once via `parse_all`; they are
-/// threaded into the model for the (currently no-op) data-flow pass.
+/// threaded into the model to drive the data-flow pass.
 pub fn load(
     project_path: &Path,
     config_path: Option<&Path>,
@@ -162,7 +163,7 @@ pub fn build_model(project: &Project, title: Option<String>) -> GraphModel {
 }
 
 /// Build the structural graph model from an already-loaded project and its
-/// parsed scripts. The scripts feed the data-flow pass (currently a no-op).
+/// parsed scripts. The scripts feed the data-flow pass.
 pub fn build_model_with_scripts(
     project: &Project,
     scripts: &[ParsedScript],
@@ -199,7 +200,8 @@ pub fn build_model_with_scripts(
     //    node for their rate.
     add_schedule_edges(&mut model);
 
-    // 6. Data-flow edges (stubbed — see the function).
+    // 6. Data-flow edges from per-script read/write analysis (reads -> fn,
+    //    fn -> writes).
     add_data_flow_edges(project, scripts, &mut model);
 
     sort_for_determinism(&mut model);
@@ -327,21 +329,50 @@ fn format_rate(rate: f64) -> String {
     }
 }
 
-/// **STUB.** Add [`EdgeKind::DataFlow`] edges (a script reads one symbol and
-/// writes another).
+/// Add [`EdgeKind::DataFlow`] edges from per-script read/write analysis.
 ///
-/// TODO(workflow-3): Implement real data-flow extraction. Accurate edges need
-/// per-script CST read/write analysis — for each function's `.m1scr`, parse the
-/// body with `m1_core::parse`, collect the set of symbols read and the set
-/// written, and emit `read -> function` and `function -> written` edges. The
-/// full version will reuse `m1-eval`'s read/write *summary* module (built in
-/// Workflow 3) rather than re-deriving the analysis here.
+/// For each discovered `.m1scr`, resolve its enclosing group
+/// ([`Project::group_for_script`]) and the function symbol it backs
+/// ([`Project::function_symbol_for_script`]), then compute the script's read /
+/// write sets via [`crate::dataflow::io_sets`]. Edges are oriented so reads point
+/// **into** the function and writes point **out of** it:
 ///
-/// For now this is intentionally a no-op so the structural scaffold compiles and
-/// the other three edge types are exercised end to end. The parsed `scripts`
-/// slice is already threaded in (M1) ready for the real walker (M2/M3).
-fn add_data_flow_edges(_project: &Project, _scripts: &[ParsedScript], _model: &mut GraphModel) {
-    // Intentionally empty in the scaffold. See the doc comment above.
+/// - `read -> function` ([`EdgeKind::DataFlow`]) for every read, and
+/// - `function -> write` ([`EdgeKind::DataFlow`]) for every write.
+///
+/// This makes "what feeds this channel" a pure upstream walk. An edge is emitted
+/// **only when both endpoints exist as graph nodes**, so builtins and external
+/// channels (which `io_sets` already drops, but defensively guarded here) and any
+/// function whose symbol is not a surfaced node produce no edge.
+fn add_data_flow_edges(project: &Project, scripts: &[ParsedScript], model: &mut GraphModel) {
+    let node_ids: BTreeSet<String> = model.nodes.iter().map(|n| n.id.clone()).collect();
+    let mut edges = Vec::new();
+    for script in scripts {
+        // The function node this script backs; without it there is nothing to
+        // orient reads/writes around.
+        let Some(func) = project.function_symbol_for_script(&script.name) else {
+            continue;
+        };
+        if !node_ids.contains(&func) {
+            continue;
+        }
+        let group = project.group_for_script(&script.name);
+        let sets = crate::dataflow::io_sets(script, project, group.as_deref());
+
+        // Reads point into the function; writes point out of it. Both endpoints
+        // must be real graph nodes (guards builtins / external channels).
+        for read in &sets.reads {
+            if node_ids.contains(read) {
+                edges.push(GraphEdge::new(read.clone(), func.clone(), EdgeKind::DataFlow));
+            }
+        }
+        for write in &sets.writes {
+            if node_ids.contains(write) {
+                edges.push(GraphEdge::new(func.clone(), write.clone(), EdgeKind::DataFlow));
+            }
+        }
+    }
+    model.edges.extend(edges);
 }
 
 /// Sort nodes and edges into a deterministic order so DOT / JSON / HTML output
@@ -505,6 +536,103 @@ mod tests {
             Some(2),
             "2-D table from .m1cfg should give table_dims == Some(2); got {:?}",
             table.table_dims
+        );
+    }
+
+    // A project shaped like the smoke fixture: an Engine group with Speed +
+    // Limited channels, a MaxSpeed parameter, and a Limiter function backed by
+    // `Limiter.m1scr`. Used to exercise real data-flow edges.
+    const DATAFLOW_PROJECT: &str = r#"<?xml version="1.0"?>
+<MoTeCM1BuildSession>
+ <Project Name="Synthetic" TargetHardware="ecu120">
+  <ComponentStream><List>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Engine"/>
+   <Component Classname="BuiltIn.Channel" Name="Root.Engine.Speed"><Props Type="f32"><Locale><Default Unit="rpm"/></Locale></Props></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Engine.Limited"><Props Type="f32"><Locale><Default Unit="rpm"/></Locale></Props></Component>
+   <Component Classname="BuiltIn.Parameter" Name="Root.Engine.MaxSpeed.Value"><Props Type="u16" Security="Tune"/></Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="Limiter.m1scr" Name="Root.Engine.Limiter"/>
+  </List></ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>"#;
+
+    /// Parse a synthetic script body under the given `.m1scr` file name.
+    fn script_named(file_name: &str, src: &str) -> ParsedScript {
+        let pairs = vec![(file_name.to_string(), src.to_string())];
+        parse_all(&pairs).into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn data_flow_edges_orient_reads_in_writes_out() {
+        // The Limiter reads Speed + MaxSpeed.Value and writes Limited. Reads
+        // point *into* the function; writes point *out of* it.
+        let project = Project::from_xml(DATAFLOW_PROJECT).unwrap();
+        let script = script_named(
+            "Limiter.m1scr",
+            "local s = Root.Engine.Speed;\n\
+             local m = Root.Engine.MaxSpeed.Value;\n\
+             Root.Engine.Limited = s > m ? m : s;\n",
+        );
+        let model = build_model_with_scripts(&project, std::slice::from_ref(&script), None);
+
+        let has = |from: &str, to: &str| {
+            model
+                .edges
+                .iter()
+                .any(|e| e.from == from && e.to == to && e.kind == EdgeKind::DataFlow)
+        };
+        assert!(
+            has("Root.Engine.Speed", "Root.Engine.Limiter"),
+            "read Speed -> Limiter; edges = {:?}",
+            model.edges
+        );
+        assert!(
+            has("Root.Engine.MaxSpeed.Value", "Root.Engine.Limiter"),
+            "read MaxSpeed.Value -> Limiter; edges = {:?}",
+            model.edges
+        );
+        assert!(
+            has("Root.Engine.Limiter", "Root.Engine.Limited"),
+            "Limiter -> write Limited; edges = {:?}",
+            model.edges
+        );
+        assert!(
+            model.edge_count(EdgeKind::DataFlow) >= 3,
+            "expected at least the three data-flow edges; got {}",
+            model.edge_count(EdgeKind::DataFlow)
+        );
+    }
+
+    #[test]
+    fn data_flow_edges_skip_unknown_endpoints() {
+        // A read whose canonical path is a builtin (`Calculate.Max`) and a write
+        // to a channel that is not a graph node must produce no data-flow edge:
+        // an edge is only emitted when BOTH endpoints exist as nodes.
+        let project = Project::from_xml(DATAFLOW_PROJECT).unwrap();
+        let script = script_named(
+            "Limiter.m1scr",
+            // Builtin call (no Calculate node), and a write to a non-existent
+            // channel `Root.Engine.Phantom` (not declared in the project).
+            "Root.Engine.Phantom = Calculate.Max(Root.Engine.Speed, 1);\n",
+        );
+        let model = build_model_with_scripts(&project, std::slice::from_ref(&script), None);
+
+        // No edge touches the builtin object or the phantom (non-node) channel.
+        assert!(
+            !model.edges.iter().any(|e| e.kind == EdgeKind::DataFlow
+                && (e.from.starts_with("Calculate")
+                    || e.to.starts_with("Calculate")
+                    || e.from == "Root.Engine.Phantom"
+                    || e.to == "Root.Engine.Phantom")),
+            "no edge to a builtin or absent node; edges = {:?}",
+            model.edges
+        );
+        // The real read (Speed) still wires to the function — both endpoints exist.
+        assert!(
+            model.edges.iter().any(|e| e.from == "Root.Engine.Speed"
+                && e.to == "Root.Engine.Limiter"
+                && e.kind == EdgeKind::DataFlow),
+            "Speed -> Limiter still present; edges = {:?}",
+            model.edges
         );
     }
 

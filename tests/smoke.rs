@@ -43,6 +43,14 @@ fn builds_nonempty_graph_from_fixture() {
         "expected the Limiter function node; nodes = {:?}",
         model.nodes
     );
+
+    // Data-flow edges are extracted from the Limiter script (reads Speed +
+    // MaxSpeed.Value, writes Limited) — no longer a no-op stub.
+    assert!(
+        model.edge_count(EdgeKind::DataFlow) > 0,
+        "expected data-flow edges; edges = {:?}",
+        model.edges
+    );
 }
 
 #[test]
