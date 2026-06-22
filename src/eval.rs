@@ -16,7 +16,7 @@
 
 use std::collections::BTreeSet;
 
-use m1_eval::{Trace, Value};
+use m1_eval::{Counterfactual, Trace, Value};
 
 use crate::model::{GraphNode, NodeOverlay, Overlay, OverlayCell, OverlayKind};
 
@@ -66,6 +66,49 @@ pub fn value_overlay_from_trace(trace: &Trace, nodes: &[GraphNode]) -> Overlay {
     }
 }
 
+/// Build a [`OverlayKind::Diff`] overlay from an `m1-eval` [`Counterfactual`],
+/// keyed by graph-node id.
+///
+/// Starts from the [`OverlayKind::Value`] overlay of the counterfactual
+/// [`Trace`] (so each node's `series` is the recomputed column and
+/// [`Overlay::external`] is populated), then switches `kind` to `Diff` and
+/// layers the per-channel diff on top: for every `cf.diff.channels` entry whose
+/// path matches a node already in the overlay, the [`NodeOverlay`] gains its
+/// per-tick `delta` and `max_abs_delta`. [`Overlay::changed`] is
+/// [`Diff::changed_channels`](m1_eval::Diff::changed_channels) filtered to node
+/// ids, and [`Overlay::eps`] is the diff's threshold.
+///
+/// The **no-op ⇒ no change** invariant is preserved: a diff with no changed
+/// channels yields an empty `changed` set (the engine's identity counterfactual
+/// reports none, so nothing is highlighted).
+pub fn diff_overlay(cf: &Counterfactual, nodes: &[GraphNode]) -> Overlay {
+    let mut overlay = value_overlay_from_trace(&cf.trace, nodes);
+    overlay.kind = OverlayKind::Diff;
+
+    // Attach per-tick delta + summary to the nodes that have a diff column. A
+    // `ChannelDiff` exists only for channels shared (numerically) by trace and
+    // log, so this is a subset of the value-overlay nodes; the rest stay neutral.
+    for (path, channel_diff) in &cf.diff.channels {
+        if let Some(node_overlay) = overlay.nodes.get_mut(path) {
+            node_overlay.delta = Some(channel_diff.delta.clone());
+            node_overlay.max_abs_delta = Some(channel_diff.max_abs_delta);
+        }
+    }
+
+    // The changed cone, restricted to graph nodes. `changed_channels` is already
+    // sorted and empty for a no-op override (the load-bearing invariant).
+    overlay.changed = cf
+        .diff
+        .changed_channels()
+        .into_iter()
+        .filter(|path| overlay.nodes.contains_key(*path))
+        .map(str::to_string)
+        .collect();
+
+    overlay.eps = Some(cf.diff.eps);
+    overlay
+}
+
 /// Map one `m1-eval` [`Value`] to a faithful, ramp-aware [`OverlayCell`].
 ///
 /// Numeric values (`Float`/`Int`/`Uint`) become [`OverlayCell::Num`] via
@@ -92,6 +135,7 @@ fn value_cell(value: &Value) -> OverlayCell {
 mod tests {
     use super::*;
     use crate::model::NodeKind;
+    use m1_eval::{ChannelDiff, Counterfactual, Diff};
 
     /// A `Trace` with one tick and the given channels (no externals).
     fn trace_with(channels: &[(&str, Vec<Value>)], time: Vec<f64>) -> Trace {
@@ -105,6 +149,64 @@ mod tests {
 
     fn node(id: &str) -> GraphNode {
         GraphNode::new(id, NodeKind::Channel)
+    }
+
+    /// A `ChannelDiff` from a per-tick `delta`, deriving `max_abs_delta` and the
+    /// `changed` flag against `eps` (mirrors `Diff::between_eps`'s arithmetic so a
+    /// hand-built diff is self-consistent).
+    fn channel_diff(counterfactual: &[f64], logged: &[f64], eps: f64) -> ChannelDiff {
+        let delta: Vec<f64> = counterfactual
+            .iter()
+            .zip(logged)
+            .map(|(cf, lg)| cf - lg)
+            .collect();
+        let max_abs_delta = delta
+            .iter()
+            .copied()
+            .map(f64::abs)
+            .filter(|d| d.is_finite())
+            .fold(0.0_f64, f64::max);
+        let changed = max_abs_delta > eps;
+        ChannelDiff {
+            logged: logged.to_vec(),
+            counterfactual: counterfactual.to_vec(),
+            delta,
+            max_abs_delta,
+            changed,
+        }
+    }
+
+    /// Hand-build a `Counterfactual`: a trace from `counterfactual` columns and a
+    /// `Diff` whose `ChannelDiff`s compare those columns against `logged` ones.
+    fn counterfactual_with(
+        cols: &[(&str, Vec<f64>, Vec<f64>)],
+        time: Vec<f64>,
+        eps: f64,
+    ) -> Counterfactual {
+        let trace = trace_with(
+            &cols
+                .iter()
+                .map(|(path, cf, _)| {
+                    (
+                        *path,
+                        cf.iter().map(|v| Value::Float(*v)).collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            time.clone(),
+        );
+        let mut channels = std::collections::BTreeMap::new();
+        for (path, cf, logged) in cols {
+            channels.insert((*path).to_string(), channel_diff(cf, logged, eps));
+        }
+        Counterfactual {
+            trace,
+            diff: Diff {
+                time,
+                channels,
+                eps,
+            },
+        }
     }
 
     #[test]
@@ -214,6 +316,92 @@ mod tests {
         assert_eq!(
             overlay.nodes["Root.Demo.Output"].series,
             vec![OverlayCell::Num(50.0)]
+        );
+    }
+
+    #[test]
+    fn diff_overlay_marks_changed_nodes() {
+        // `Mid` moved by +5 under the override; `Sensor` held its logged value.
+        let cf = counterfactual_with(
+            &[
+                ("Root.CF.Sensor", vec![10.0, 10.0], vec![10.0, 10.0]),
+                ("Root.CF.Mid", vec![30.0, 30.0], vec![25.0, 25.0]),
+            ],
+            vec![0.0, 1.0],
+            1e-9,
+        );
+        let nodes = [node("Root.CF.Sensor"), node("Root.CF.Mid")];
+
+        let overlay = diff_overlay(&cf, &nodes);
+
+        assert_eq!(overlay.kind, OverlayKind::Diff);
+        assert_eq!(overlay.changed, vec!["Root.CF.Mid".to_string()]);
+        assert_eq!(overlay.nodes["Root.CF.Mid"].max_abs_delta, Some(5.0));
+        // The unchanged channel still carries its (zero) summary, never `changed`.
+        assert_eq!(overlay.nodes["Root.CF.Sensor"].max_abs_delta, Some(0.0));
+        assert_eq!(overlay.eps, Some(1e-9));
+    }
+
+    #[test]
+    fn diff_overlay_carries_per_tick_delta() {
+        let cf = counterfactual_with(
+            &[("Root.CF.Mid", vec![30.0, 31.0], vec![25.0, 25.0])],
+            vec![0.0, 1.0],
+            1e-9,
+        );
+        let nodes = [node("Root.CF.Mid")];
+
+        let overlay = diff_overlay(&cf, &nodes);
+
+        // The per-node `delta` is the `ChannelDiff.delta`, aligned to `time`.
+        assert_eq!(overlay.time, cf.diff.time);
+        assert_eq!(
+            overlay.nodes["Root.CF.Mid"].delta,
+            Some(cf.diff.channels["Root.CF.Mid"].delta.clone())
+        );
+        assert_eq!(overlay.nodes["Root.CF.Mid"].delta, Some(vec![5.0, 6.0]));
+    }
+
+    #[test]
+    fn noop_diff_has_no_changed_nodes() {
+        // The load-bearing invariant: a no-op override (counterfactual == logged)
+        // leaves the changed set empty.
+        let cf = counterfactual_with(
+            &[
+                ("Root.CF.Sensor", vec![10.0, 10.0], vec![10.0, 10.0]),
+                ("Root.CF.Mid", vec![25.0, 25.0], vec![25.0, 25.0]),
+            ],
+            vec![0.0, 1.0],
+            1e-9,
+        );
+        let nodes = [node("Root.CF.Sensor"), node("Root.CF.Mid")];
+
+        let overlay = diff_overlay(&cf, &nodes);
+
+        assert!(
+            overlay.changed.is_empty(),
+            "no-op override must not flag changes: {:?}",
+            overlay.changed
+        );
+        assert_eq!(overlay.kind, OverlayKind::Diff);
+    }
+
+    #[test]
+    fn diff_overlay_series_is_the_counterfactual_trace() {
+        // `series` reads the counterfactual trace column (so the scrubber still
+        // shows values), while `delta`/`changed` drive the highlight/ramp.
+        let cf = counterfactual_with(
+            &[("Root.CF.Mid", vec![30.0, 31.0], vec![25.0, 25.0])],
+            vec![0.0, 1.0],
+            1e-9,
+        );
+        let nodes = [node("Root.CF.Mid")];
+
+        let overlay = diff_overlay(&cf, &nodes);
+
+        assert_eq!(
+            overlay.nodes["Root.CF.Mid"].series,
+            vec![OverlayCell::Num(30.0), OverlayCell::Num(31.0)]
         );
     }
 }
