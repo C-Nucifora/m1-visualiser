@@ -66,7 +66,7 @@ mod tests {
     use crate::model::{
         EdgeKind, GraphEdge, GraphNode, NodeKind, NodeOverlay, Overlay, OverlayCell, OverlayKind,
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn sample() -> GraphModel {
         let mut g = GraphModel::new(Some("Demo".into()));
@@ -113,6 +113,44 @@ mod tests {
             external: ["Root.Engine.Output".to_string()].into_iter().collect(),
             changed: Vec::new(),
             eps: None,
+            start_tick: Some(1),
+        };
+        g.with_overlay(overlay)
+    }
+
+    /// A small DIFF-overlaid model: one changed node (`Speed`) carrying a
+    /// counterfactual `series`, a per-tick `delta`, and a `max_abs_delta`, plus an
+    /// unchanged `Output` node — so the diff-overlay viewer tests have a concrete
+    /// page whose changed cone is `["Root.Engine.Speed"]`.
+    fn diff_overlaid_sample() -> GraphModel {
+        let mut g = sample();
+        g.nodes
+            .push(GraphNode::new("Root.Engine.Output", NodeKind::Channel));
+
+        let mut nodes = BTreeMap::new();
+        nodes.insert(
+            "Root.Engine.Speed".to_string(),
+            NodeOverlay {
+                series: vec![OverlayCell::Num(10.0), OverlayCell::Num(50.0)],
+                delta: Some(vec![0.0, 30.0]),
+                max_abs_delta: Some(30.0),
+            },
+        );
+        nodes.insert(
+            "Root.Engine.Output".to_string(),
+            NodeOverlay {
+                series: vec![OverlayCell::Num(20.0), OverlayCell::Num(20.0)],
+                delta: Some(vec![0.0, 0.0]),
+                max_abs_delta: Some(0.0),
+            },
+        );
+        let overlay = Overlay {
+            kind: OverlayKind::Diff,
+            time: vec![0.0, 0.01],
+            nodes,
+            external: BTreeSet::new(),
+            changed: vec!["Root.Engine.Speed".to_string()],
+            eps: Some(1e-9),
             start_tick: Some(1),
         };
         g.with_overlay(overlay)
@@ -391,6 +429,99 @@ mod tests {
         assert!(
             html.contains("valueSize") || html.contains("overlay-num"),
             "expected a size-by-value rule for numeric overlay nodes"
+        );
+    }
+
+    // ---- O9: the DIFF overlay viewer (changed cone, delta ramp, auto-focus) ----
+
+    #[test]
+    fn diff_overlay_embeds_diff_json() {
+        // The diff overlay rides inside the same GRAPH JSON, so rendering a
+        // diff-overlaid model must embed `"kind":"diff"` and the `changed`
+        // node-id list (the override's downstream cone — the headline answer).
+        let html = render(&diff_overlaid_sample());
+        let assign = html
+            .split("\nvar GRAPH =")
+            .nth(1)
+            .expect("a GRAPH assignment");
+        let stmt = assign.split(';').next().expect("a terminated statement");
+        assert!(
+            stmt.contains("\"overlay\""),
+            "the diff overlay must ride inside the embedded GRAPH JSON:\n{stmt:.200}"
+        );
+        assert!(
+            stmt.contains("\"kind\":\"diff\""),
+            "the embedded overlay must declare kind=diff:\n{stmt:.200}"
+        );
+        // The changed node-id list is embedded so the viewer can highlight it.
+        assert!(
+            stmt.contains("\"changed\""),
+            "the embedded overlay must carry a changed list:\n{stmt:.200}"
+        );
+        assert!(
+            stmt.contains("Root.Engine.Speed"),
+            "the changed node id must be in the embedded JSON:\n{stmt:.200}"
+        );
+    }
+
+    #[test]
+    fn viewer_highlights_changed_nodes() {
+        // The diff viewer references `overlay.changed` and an `applyDiff` function
+        // that adds a `changed` highlight class to those nodes (reusing the
+        // cone-highlight visual vocabulary).
+        let html = render(&diff_overlaid_sample());
+        assert!(
+            html.contains("overlay.changed"),
+            "the diff viewer must reference overlay.changed"
+        );
+        assert!(
+            html.contains("applyDiff"),
+            "expected an applyDiff function driving the changed-cone highlight"
+        );
+        // A `changed` class marks the moved nodes; the unchanged remainder is
+        // dimmed with the existing cone-dimmed style.
+        assert!(
+            html.contains("\"changed\"") || html.contains("addClass(\"changed\""),
+            "expected a `changed` highlight class on moved nodes"
+        );
+        assert!(
+            html.contains("cone-dimmed"),
+            "expected the unchanged remainder dimmed via the existing cone-dimmed style"
+        );
+    }
+
+    #[test]
+    fn viewer_diff_ramp_by_max_abs_delta() {
+        // A `deltaColor(d)` ramp keyed on `max_abs_delta` exists, so nodes are
+        // coloured by how much the override moved them (neutral at 0).
+        let html = render(&diff_overlaid_sample());
+        assert!(
+            html.contains("deltaColor"),
+            "expected a deltaColor(d) ramp keyed on max_abs_delta"
+        );
+        assert!(
+            html.contains("max_abs_delta"),
+            "the diff ramp must read each node's max_abs_delta"
+        );
+    }
+
+    #[test]
+    fn viewer_diff_default_focus_is_changed_cone() {
+        // On load, a diff overlay auto-runs applyDiff() so the changed set is
+        // highlighted without a click — the headline "what did this override move"
+        // answer is visible immediately.
+        let html = render(&diff_overlaid_sample());
+        // The guard is the diff-kind branch.
+        assert!(
+            html.contains("overlay.kind === \"diff\"") || html.contains("kind === \"diff\""),
+            "the diff block must be guarded by a kind=diff check"
+        );
+        // applyDiff() is invoked on load (not only from a click handler), so the
+        // changed cone is the default focus.
+        let invoked = html.matches("applyDiff()").count();
+        assert!(
+            invoked >= 1,
+            "expected applyDiff() to be auto-run on load so the changed cone is the default focus"
         );
     }
 }

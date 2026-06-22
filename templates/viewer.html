@@ -280,6 +280,17 @@ document.addEventListener("DOMContentLoaded", function () {
         style: {
           "border-width": 2, "border-style": "dashed", "border-color": "#f39c12"
         }
+      },
+      {
+        // DIFF overlay, a changed node (in the override's downstream cone): fill
+        // from the deltaColor ramp (set as data() by applyDiff), and a white halo
+        // border so the moved cone reads at a glance. Reuses the cone-highlight
+        // visual vocabulary the user already knows from click-to-highlightCone.
+        selector: "node.changed",
+        style: {
+          "background-color": "data(dColor)",
+          "border-width": 3, "border-color": "#fff", "z-index": 25
+        }
       }
     ],
     // The default layout is a layered (breadthfirst, directed) DAG read that
@@ -602,6 +613,130 @@ document.addEventListener("DOMContentLoaded", function () {
       });
     }
     applyOverlayAtTick(startTick);
+  }
+
+  // --- DIFF overlay: highlight the changed cone, colour by max-abs-delta -------
+  // Guarded by `GRAPH.overlay` of kind "diff", so value-mode and the structural
+  // page are unaffected. The DIFF overlay reuses the cone-highlight visual
+  // vocabulary the user already knows: the override's downstream cone (the
+  // `changed` set) is highlighted and coloured by how much each node moved, while
+  // the unchanged remainder is dimmed with the existing `cone-dimmed` style. The
+  // scrubber steps each node's per-tick `delta`; the readout shows
+  // `id: logged → counterfactual (Δ delta)` for the focused node. applyDiff()
+  // auto-runs on load so the moved cone — the headline "what did this override
+  // move" answer — is visible without a click; click-to-highlightCone still works.
+  if (overlay && overlay.kind === "diff") {
+    document.body.classList.add("has-overlay");
+    var dbar = document.getElementById("overlaybar");
+    if (dbar) { dbar.classList.add("shown"); }
+
+    var dtime = overlay.time || [];
+    var dLastTick = Math.max(0, dtime.length - 1);
+    var dStartTick = (typeof overlay.start_tick === "number") ? overlay.start_tick : dLastTick;
+    if (dStartTick < 0) { dStartTick = 0; }
+    if (dStartTick > dLastTick) { dStartTick = dLastTick; }
+
+    var changedIds = new Set(overlay.changed || []);
+
+    // The largest max_abs_delta across every node, used to normalise the colour
+    // ramp so the most-moved node saturates. Computed once.
+    var dMax = 0;
+    Object.keys(overlay.nodes || {}).forEach(function (id) {
+      var m = overlay.nodes[id].max_abs_delta;
+      if (typeof m === "number" && m > dMax) { dMax = m; }
+    });
+
+    // A perceptual ramp keyed on a node's max_abs_delta, neutral (grey) at 0 and
+    // saturating amber→red as the change grows. Returns an rgb() string.
+    function deltaColor(d) {
+      var mag = (typeof d === "number") ? Math.abs(d) : 0;
+      var t = dMax > 0 ? mag / dMax : 0;
+      if (t < 0) { t = 0; } else if (t > 1) { t = 1; }
+      // #7f8c8d (neutral grey, no change) -> #e67e22 (amber) -> #c0392b (red).
+      var stops = [[127, 140, 141], [230, 126, 34], [192, 57, 43]];
+      var seg = t < 0.5 ? 0 : 1;
+      var local = t < 0.5 ? t / 0.5 : (t - 0.5) / 0.5;
+      var a = stops[seg], b = stops[seg + 1];
+      var r = Math.round(a[0] + (b[0] - a[0]) * local);
+      var g = Math.round(a[1] + (b[1] - a[1]) * local);
+      var bl = Math.round(a[2] + (b[2] - a[2]) * local);
+      return "rgb(" + r + "," + g + "," + bl + ")";
+    }
+
+    // Format a numeric value for the diff readout; non-finite falls back to "—".
+    function diffNum(v) {
+      return (typeof v === "number" && isFinite(v)) ? String(v) : "—";
+    }
+
+    var dReadout = document.getElementById("readout");
+    var dScrubber = document.getElementById("scrubber");
+
+    // Highlight the changed cone: add a `changed` class to every node the override
+    // moved, colour it by deltaColor(max_abs_delta), and dim the unchanged
+    // remainder with the existing cone-dimmed style so the moved cone reads
+    // instantly. Re-runnable; clears its own classes first.
+    function applyDiff() {
+      cy.elements().removeClass("changed cone-dimmed");
+      if (changedIds.size === 0) { return; }
+      var changedNodes = cy.collection();
+      cy.nodes().forEach(function (n) {
+        if (changedIds.has(n.data("id"))) {
+          var no = (overlay.nodes || {})[n.data("id")] || {};
+          n.data("dColor", deltaColor(no.max_abs_delta));
+          n.addClass("changed");
+          changedNodes = changedNodes.union(n);
+        }
+      });
+      // Dim everything outside the changed set so the moved cone is the focus.
+      cy.elements().not(changedNodes).addClass("cone-dimmed");
+    }
+
+    // Step the per-tick delta over overlay.time: refresh the time readout for the
+    // scrubbed tick (the per-node delta drives the readout on node click below).
+    function applyDiffAtTick(i) {
+      var t = dtime[i];
+      var dlabel = document.getElementById("time-readout");
+      if (dlabel) { dlabel.textContent = "t = " + (t != null ? t : i); }
+    }
+
+    // The diff readout on node click: `id: logged → counterfactual (Δ delta)` for
+    // the focused node at the scrubber's current tick (logged = counterfactual −
+    // delta, since the series carries the counterfactual column). highlightCone
+    // still fires from its own tap handler for ad-hoc exploration.
+    function diffReadout(node) {
+      if (!dReadout) { return; }
+      var id = node.data("id");
+      var no = (overlay.nodes || {})[id];
+      if (!no) { dReadout.textContent = id; return; }
+      var i = dScrubber ? (dScrubber.valueAsNumber || 0) : dStartTick;
+      var cell = (no.series || [])[i];
+      var cf = (cell && typeof cell.num === "number") ? cell.num : null;
+      var delta = (no.delta || [])[i];
+      var logged = (cf != null && typeof delta === "number") ? cf - delta : null;
+      dReadout.textContent = id + ": " + diffNum(logged) + " → " + diffNum(cf) +
+        " (Δ " + diffNum(delta) + ")";
+    }
+    cy.on("tap", "node", function (evt) { diffReadout(evt.target); });
+
+    // Wire the scrubber over overlay.time and seed it at the default tick.
+    if (dScrubber) {
+      dScrubber.min = "0";
+      dScrubber.max = String(dLastTick);
+      dScrubber.value = String(dStartTick);
+      dScrubber.addEventListener("input", function () {
+        applyDiffAtTick(dScrubber.valueAsNumber || 0);
+      });
+    }
+    applyDiffAtTick(dStartTick);
+
+    // Auto-run the changed-cone highlight on load — the moved cone is the headline
+    // answer, so it must be visible without a click. Background-click clears the
+    // ad-hoc cone highlight (clearCone), then we re-assert the diff focus so the
+    // changed cone stays the resting state.
+    applyDiff();
+    cy.on("tap", function (evt) {
+      if (evt.target === cy) { applyDiff(); }
+    });
   }
 });
 </script>
