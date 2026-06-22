@@ -7,10 +7,11 @@
 //! ([`dot`], [`json`], [`html`]) consume. Only [`loader`] touches `m1-typecheck`
 //! / `m1-core` types.
 //!
-//! v1 is structural-first and covers four edge types — data-flow, table-axis,
-//! hierarchy and schedule (see [`model::EdgeKind`]). Data-flow edge extraction
-//! and a numeric value overlay (via `m1-eval`) are deferred to later workflows;
-//! see the `TODO`s in [`loader`] and the design doc.
+//! v1 is structural-first and covers all four edge types — data-flow,
+//! table-axis, hierarchy and schedule (see [`model::EdgeKind`]) — plus the
+//! interactive viewer (search, per-edge-kind filters, collapse/expand,
+//! dependency-cone highlight). The only deferred workflow is a numeric value
+//! overlay (via `m1-eval`); see the design doc.
 
 pub mod dataflow;
 pub mod dot;

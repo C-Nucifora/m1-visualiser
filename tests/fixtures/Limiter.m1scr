@@ -1,7 +1,7 @@
 // Synthetic M1 script fixture for m1-visualiser tests.
 // Reads Root.Engine.Speed and the MaxSpeed parameter, writes Root.Engine.Limited.
-// (Data-flow edge extraction from script bodies is stubbed in the v1 scaffold;
-// this script exists so the fixture has a function symbol with a backing file.)
+// The data-flow pass extracts these reads/writes into DataFlow edges
+// (reads -> Limiter, Limiter -> Limited).
 local s = Root.Engine.Speed;
 local m = Root.Engine.MaxSpeed.Value;
 Root.Engine.Limited = s > m ? m : s;

@@ -7,7 +7,11 @@
    <Component Classname="BuiltIn.Channel" Name="Root.Engine.Limited"><Props Type="f32"><Locale><Default Unit="rpm"/></Locale></Props></Component>
    <Component Classname="BuiltIn.Parameter" Name="Root.Engine.MaxSpeed.Value"><Props Type="u16" Security="Tune"/></Component>
    <Component Classname="BuiltIn.Constant" Name="Root.Engine.IdleRpm"><Props Type="u16"/></Component>
-   <Component Classname="BuiltIn.FuncUser" Filename="Limiter.m1scr" Name="Root.Engine.Limiter"/>
+   <Component Classname="BuiltIn.Table" Name="Root.Engine.Boost"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Engine.Boost.Value" Caps="AutoCreated"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Engine.Boost.X" Caps="AutoCreated"><Props Type="f32"><Locale><Default Unit="rpm"/></Locale></Props></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Engine.Boost.Y" Caps="AutoCreated"><Props Type="f32"><Locale><Default Unit="%"/></Locale></Props></Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="Limiter.m1scr" Name="Root.Engine.Limiter"><Props SelectedTrigger="Parent.Parent.Events.On 100Hz"/></Component>
   </List></ComponentStream>
  </Project>
 </MoTeCM1BuildSession>

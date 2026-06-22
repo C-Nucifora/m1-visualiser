@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # m1-visualiser design
 
-Status: v1 scaffold (structural-first). Last updated 2026-06-23.
+Status: v1 complete (structural-first). Last updated 2026-06-23.
 
 ## Purpose
 
@@ -18,13 +18,13 @@ diffing, and rendering with other tooling.
 
 ## Phasing
 
-- **v1 — structural-first (this scaffold).** Build the graph purely from the
+- **v1 — structural-first (this build).** Build the graph purely from the
   project's static structure as reported by `m1-typecheck`'s symbol table. No
-  numeric values. All four edge types below are in scope for v1, though
-  data-flow edge extraction is stubbed in this scaffold (see *Stubs / TODO*).
+  numeric values. All four edge types below — hierarchy, table-axis, schedule,
+  and data-flow — are implemented, alongside the interactive viewer.
 - **Later — value overlay.** Overlay computed numeric values (channel results,
   table lookups, parameter values) onto nodes by consuming `m1-eval`. This is
-  explicitly **not** part of the structural scaffold and adds `m1-eval` as a
+  explicitly **not** part of the structural v1 and adds `m1-eval` as a
   dependency only when that workflow lands.
 
 ## The four edge types
@@ -35,8 +35,10 @@ variant of `EdgeKind`:
 1. **DataFlow** — a script reads one symbol and writes another (e.g. a function
    reads `Root.Engine.Speed` and writes `Root.Engine.Limited`). This is the
    read/write dependency between channels/parameters and the functions that
-   produce them. Extracting these accurately requires per-script CST analysis of
-   reads and writes; see *Stubs / TODO*.
+   produce them, extracted by per-script CST analysis of reads and writes
+   (`loader::add_data_flow_edges` over `dataflow::io_sets`). Reads point into the
+   backing function; writes point out of it, so "what feeds this channel" is a
+   pure upstream walk.
 2. **TableAxis** — links a table's input-axis symbols (and its output `.Value`
    channel) to the table node, derived from `Symbol.table_meta` (axis count and
    units) plus dotted-path containment of the table's members. Models the
@@ -75,8 +77,8 @@ Each `GraphNode` carries its dotted `path`, an `id`, its `kind`, an optional
   and pluggable layered layouts (`dagre` / `elk`) that suit a data-flow DAG.
   The HTML file embeds the `GraphModel` as inline JSON plus the Cytoscape viewer
   so it is fully self-contained and offline. The Cytoscape library is vendored
-  under `templates/` (or referenced via a documented placeholder when it cannot
-  be fetched at scaffold time — see `templates/`).
+  under `templates/cytoscape.min.js` and `include_str!`'d into the page, so no
+  network access is ever needed.
 - **Graphviz DOT export** for static rendering / pipelines (`dot -Tsvg`).
 - **JSON graph export** (serde) — the canonical machine-readable form of the
   `GraphModel`, and the same payload embedded in the HTML.
@@ -106,26 +108,29 @@ everything downstream reads the plain `GraphModel`. This matches `m1-doc`, where
   provides every node and most edges: kinds, dotted paths (hierarchy), table
   metadata (`table_meta`), and rates (`call_rate_hz` / `log_rate_hz`). Pinned to
   the same git tag as the rest of the toolchain (`v0.36.0`).
-- **`m1-core`.** Pinned to `v0.12.0`. Used for CST parsing when per-script
-  data-flow read/write analysis is implemented (the full version will reuse the
-  read/write summary logic that `m1-eval` is building in Workflow 3).
+- **`m1-core`.** Pinned to `v0.12.0`. Used for CST parsing in the per-script
+  data-flow read/write analysis (`dataflow::io_sets`, a self-contained port of
+  the read/write summary logic from `m1-eval/src/summary.rs`, kept in-crate so
+  the structural build takes no `m1-eval` dependency).
 - **`m1-eval` (value overlay, later only).** Not a dependency of this structural
-  scaffold. Added when the numeric value-overlay workflow lands.
+  v1. Added when the numeric value-overlay workflow lands.
 
-## Stubs / TODO (deferred to later workflows)
+## Deferred (later workflows)
 
-These are intentionally not finished in this scaffold and are marked with
-`TODO(...)` in code:
+The structural v1 is complete: all four edge kinds (hierarchy, table-axis,
+schedule, data-flow) are extracted, and the interactive viewer ships search,
+per-edge-kind filters, collapse/expand of compound subsystems, and
+dependency-cone highlight. The only deferred workflow is:
 
-- **Data-flow edge extraction.** Accurate `DataFlow` edges need per-script CST
-  read/write analysis. The scaffold ships a minimal placeholder (no/conservative
-  edges) with a clear TODO; the full implementation will reuse `m1-eval`'s
-  read/write summary module (Workflow 3).
-- **Value overlay.** Numeric values on nodes via `m1-eval` (later phase).
-- **Interactive layout polish.** Layout tuning (dagre/elk parameters, edge
-  routing, styling per kind) is minimal in the scaffold.
-- **Collapse/expand UX.** Compound-node collapsing controls and saved view
-  state are not yet wired up.
+- **Value overlay.** Overlaying computed numeric values on nodes (channel
+  results, table lookups, parameter values) by consuming `m1-eval`. This is a
+  separate workflow that adds `m1-eval` as a dependency; until then the graph is
+  purely structural.
+
+A documented seam remains for richer layered routing — vendoring the
+`dagre`/`elk` Cytoscape layout extensions the same way the core library is
+vendored under `templates/` — but v1 ships only core Cytoscape layouts and adds
+no second vendored asset.
 
 ## Notes
 

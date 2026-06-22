@@ -13,6 +13,25 @@ fn fixture_project() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/Project.m1prj")
 }
 
+/// Path to the fixture's sibling `.m1cfg`, which supplies the `Boost` table's
+/// 2-D shape (so the table node records `table_dims`). It lives next to the
+/// project file and is the same config the CLI's sibling-discovery would pick.
+fn fixture_config() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/parameters.m1cfg")
+}
+
+/// Load the full fixture exactly as the CLI does — project plus its sibling
+/// `.m1cfg` — so all four edge kinds (hierarchy, data-flow, table-axis,
+/// schedule) are exercised from a single project.
+fn load_full() -> m1_visualiser::model::GraphModel {
+    loader::load(
+        &fixture_project(),
+        Some(&fixture_config()),
+        Some("Synthetic".into()),
+    )
+    .expect("full fixture project should load")
+}
+
 #[test]
 fn builds_nonempty_graph_from_fixture() {
     let model = loader::load(&fixture_project(), None, Some("Synthetic".into()))
@@ -155,4 +174,106 @@ fn viewer_runs_cone_over_real_dataflow() {
         page.contains("\"Root.Engine.Limited\""),
         "embedded graph should carry the downstream write endpoint"
     );
+}
+
+// --- M10: end-to-end integration + determinism --------------------------------
+
+#[test]
+fn full_v1_graph_has_all_four_edge_kinds() {
+    // A single project must drive every structural relationship the v1 graph
+    // models. The full fixture combines: dotted-path nesting (Hierarchy), the
+    // Limiter script's reads/writes (DataFlow), a `BuiltIn.Table` with members +
+    // sibling `.m1cfg` (TableAxis), and a rated FuncUser via `SelectedTrigger`
+    // (Schedule).
+    let model = load_full();
+
+    for kind in [
+        EdgeKind::Hierarchy,
+        EdgeKind::DataFlow,
+        EdgeKind::TableAxis,
+        EdgeKind::Schedule,
+    ] {
+        assert!(
+            model.edge_count(kind) > 0,
+            "expected at least one {kind:?} edge; edges = {:?}",
+            model.edges
+        );
+    }
+}
+
+#[test]
+fn output_is_deterministic() {
+    // Building the model twice from the same inputs must yield byte-identical
+    // JSON. This guards the loader's sort/dedup (`sort_for_determinism`) against
+    // any reliance on filesystem enumeration or hash-map iteration order.
+    let a = json::render(&load_full());
+    let b = json::render(&load_full());
+    assert_eq!(a, b, "model JSON must be byte-identical across builds");
+
+    // The same must hold for the static and interactive renderers, which embed
+    // the (already-sorted) model.
+    let model = load_full();
+    assert_eq!(
+        dot::render(&model),
+        dot::render(&model),
+        "DOT must be stable"
+    );
+    assert_eq!(
+        html::render(&model),
+        html::render(&model),
+        "HTML must be stable"
+    );
+}
+
+#[test]
+fn html_dot_json_all_render_from_full_fixture() {
+    // All three renderers emit non-trivial output from the full fixture.
+    let model = load_full();
+
+    // DOT: a well-formed digraph mentioning real fixture content.
+    let dot = dot::render(&model);
+    assert!(dot.starts_with("digraph m1 {"), "DOT header: {dot:.40}");
+    assert!(dot.trim_end().ends_with('}'), "DOT should be closed");
+    assert!(
+        dot.contains("Root.Engine.Speed"),
+        "DOT should mention a fixture node"
+    );
+
+    // JSON: parses and round-trips to matching node/edge counts.
+    let json_str = json::render(&model);
+    let value: serde_json::Value = serde_json::from_str(&json_str).expect("JSON should parse");
+    assert_eq!(
+        value["nodes"].as_array().unwrap().len(),
+        model.nodes.len(),
+        "JSON node count should match model"
+    );
+    assert_eq!(
+        value["edges"].as_array().unwrap().len(),
+        model.edges.len(),
+        "JSON edge count should match model"
+    );
+    // Every edge kind from the full fixture survives serialization.
+    let edge_kinds: std::collections::BTreeSet<&str> = value["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    for tag in ["hierarchy", "data_flow", "table_axis", "schedule"] {
+        assert!(
+            edge_kinds.contains(tag),
+            "JSON edges should carry a {tag} edge; got {edge_kinds:?}"
+        );
+    }
+
+    // HTML: self-contained (Cytoscape inlined, no placeholders) and carries the
+    // embedded graph data the viewer needs.
+    let page = html::render(&model);
+    assert!(page.contains("<!DOCTYPE html>"), "HTML doctype");
+    assert!(page.contains("cytoscape"), "Cytoscape.js inlined");
+    assert!(
+        !page.contains("/*__GRAPH_JSON__*/") && !page.contains("/*__CYTOSCAPE_JS__*/"),
+        "no leftover placeholders"
+    );
+    assert!(page.contains("Root.Engine.Speed"), "graph data embedded");
 }
