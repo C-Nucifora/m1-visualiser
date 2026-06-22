@@ -226,6 +226,41 @@ pub struct Overlay {
     /// The diff threshold (`eps`) in [`OverlayKind::Diff`] mode; `None` otherwise.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub eps: Option<f64>,
+    /// The scrubber's initial tick — an index into [`Overlay::time`] the viewer
+    /// opens on. Set by the CLI's `--at-time` flag (nearest tick to the requested
+    /// second) or its default (the last tick). `None` when no overlay run set one;
+    /// the full series is always embedded, so the scrubber still spans every tick.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub start_tick: Option<usize>,
+}
+
+impl Overlay {
+    /// The index of the tick in [`Overlay::time`] nearest to `time_s` seconds, or
+    /// `None` if the axis is empty.
+    ///
+    /// "Nearest" is by absolute distance; ties resolve to the lower index (the
+    /// earlier tick). This backs the CLI's `--at-time` flag, which records the
+    /// chosen index as [`Overlay::start_tick`] so the viewer opens its scrubber
+    /// there rather than at the default last tick.
+    #[must_use]
+    pub fn nearest_tick(&self, time_s: f64) -> Option<usize> {
+        self.time
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| (*a - time_s).abs().total_cmp(&(*b - time_s).abs()))
+            .map(|(i, _)| i)
+    }
+
+    /// Record `tick` as the scrubber's initial tick and return the overlay.
+    ///
+    /// The CLI sets this from `--at-time` (via [`Overlay::nearest_tick`]) or to the
+    /// last tick by default; the viewer reads it as a start hint only — the whole
+    /// series is still embedded, so the scrubber spans every tick regardless.
+    #[must_use]
+    pub fn with_start_tick(mut self, tick: usize) -> Self {
+        self.start_tick = Some(tick);
+        self
+    }
 }
 
 /// The whole project's structural graph. Nodes and edges are kept in
@@ -375,6 +410,7 @@ mod tests {
             external: ["Root.Demo.Speed".to_string()].into_iter().collect(),
             changed: vec!["Root.Demo.Output".to_string()],
             eps: Some(1e-9),
+            start_tick: Some(1),
         };
         let json = serde_json::to_string(&overlay).unwrap();
         let back: Overlay = serde_json::from_str(&json).unwrap();
@@ -419,6 +455,7 @@ mod tests {
             external: BTreeSet::new(),
             changed: Vec::new(),
             eps: None,
+            start_tick: None,
         }
     }
 
@@ -471,6 +508,46 @@ mod tests {
     }
 
     #[test]
+    fn nearest_tick_picks_closest_index() {
+        // The `--at-time` backing: nearest by absolute distance, ties to the
+        // lower index, `None` on an empty axis.
+        let overlay = sample_overlay("Root.Demo.Output", 1.0);
+        let mut overlay = overlay;
+        overlay.time = vec![0.0, 0.01, 0.02, 0.03];
+
+        assert_eq!(overlay.nearest_tick(0.0), Some(0));
+        assert_eq!(overlay.nearest_tick(0.029), Some(3));
+        assert_eq!(overlay.nearest_tick(0.011), Some(1));
+        // Far past the end clamps to the last tick.
+        assert_eq!(overlay.nearest_tick(100.0), Some(3));
+        // A tie (0.005 is equidistant from ticks 0 and 1) resolves to the lower.
+        assert_eq!(overlay.nearest_tick(0.005), Some(0));
+
+        let mut empty = sample_overlay("Root.Demo.Output", 1.0);
+        empty.time = Vec::new();
+        assert_eq!(empty.nearest_tick(0.0), None);
+    }
+
+    #[test]
+    fn with_start_tick_records_the_hint() {
+        let overlay = sample_overlay("Root.Demo.Output", 1.0).with_start_tick(2);
+        assert_eq!(overlay.start_tick, Some(2));
+        // It serialises so the viewer can open there; absent it stays out of JSON.
+        let json = serde_json::to_string(&overlay).unwrap();
+        assert!(
+            json.contains("start_tick"),
+            "start_tick must serialise: {json}"
+        );
+
+        let plain = sample_overlay("Root.Demo.Output", 1.0);
+        let plain_json = serde_json::to_string(&plain).unwrap();
+        assert!(
+            !plain_json.contains("start_tick"),
+            "an unset start_tick must not leak into JSON: {plain_json}"
+        );
+    }
+
+    #[test]
     fn overlaid_model_round_trips_through_json() {
         let mut g = GraphModel::new(Some("Demo".into()));
         g.nodes
@@ -491,6 +568,7 @@ mod tests {
             external: BTreeSet::new(),
             changed: Vec::new(),
             eps: None,
+            start_tick: None,
         });
         let json = serde_json::to_string(&g).unwrap();
         assert!(json.contains("overlay"));

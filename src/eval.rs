@@ -82,6 +82,7 @@ pub fn value_overlay_from_trace(trace: &Trace, nodes: &[GraphNode]) -> Overlay {
         external,
         changed: Vec::new(),
         eps: None,
+        start_tick: None,
     }
 }
 
@@ -142,6 +143,7 @@ pub fn value_overlay_from_log(log: &Log, nodes: &[GraphNode]) -> Overlay {
         external: BTreeSet::new(),
         changed: Vec::new(),
         eps: None,
+        start_tick: None,
     }
 }
 
