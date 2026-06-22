@@ -11,9 +11,10 @@
 //! HTML shell and the Cytoscape library are baked into the binary at compile
 //! time via [`include_str!`], so the tool ships them itself.
 //!
-//! TODO(later): collapse/expand controls for compound (group) nodes, a
-//! dagre/elk layered layout (those layout extensions still need vendoring), and
-//! filtering by edge kind.
+//! The viewer ships a node search box and per-edge-kind filter toggles, both
+//! driven entirely by the embedded graph JSON in plain JS (no extra vendored
+//! asset). TODO(later): collapse/expand controls for compound (group) nodes and
+//! a dagre/elk layered layout (those layout extensions still need vendoring).
 
 use crate::json;
 use crate::model::GraphModel;
@@ -92,5 +93,53 @@ mod tests {
         g.nodes.push(GraphNode::new("X", NodeKind::Group));
         let html = render(&g);
         assert!(html.contains("A&lt;b&gt;&amp;c"));
+    }
+
+    #[test]
+    fn viewer_has_search_and_filter_controls() {
+        let html = render(&sample());
+        // A search input the viewer wires to dim/undim nodes by label/id.
+        assert!(
+            html.contains("id=\"search\""),
+            "expected a search input with id=\"search\""
+        );
+        // One filter checkbox per edge kind, keyed by the EdgeKind tag so the
+        // viewer can show/hide edges of that kind. Lock every tag from the model.
+        for kind in [
+            EdgeKind::DataFlow,
+            EdgeKind::TableAxis,
+            EdgeKind::Hierarchy,
+            EdgeKind::Schedule,
+        ] {
+            let tag = kind.tag();
+            let checkbox_id = format!("id=\"filter-{tag}\"");
+            assert!(
+                html.contains(&checkbox_id),
+                "expected a filter checkbox with {checkbox_id} for edge kind {tag}"
+            );
+            // And it must be a checkbox input, not just a stray id.
+            assert!(
+                html.contains("type=\"checkbox\""),
+                "expected checkbox inputs for the edge-kind filters"
+            );
+        }
+    }
+
+    #[test]
+    fn viewer_embeds_all_four_edge_kinds_legend() {
+        let html = render(&sample());
+        // The legend (locked from M-prior) lists every edge kind by its CSS tag.
+        for kind in [
+            EdgeKind::DataFlow,
+            EdgeKind::TableAxis,
+            EdgeKind::Hierarchy,
+            EdgeKind::Schedule,
+        ] {
+            let legend_class = format!("e-{}", kind.tag());
+            assert!(
+                html.contains(&legend_class),
+                "expected the legend to mention {legend_class}"
+            );
+        }
     }
 }

@@ -13,6 +13,17 @@
     background: #1e1e24; color: #eee; font-size: 14px; z-index: 10;
   }
   #toolbar strong { font-weight: 600; }
+  #toolbar input#search {
+    background: #2b2b33; color: #eee; border: 1px solid #444; border-radius: 3px;
+    padding: 3px 8px; font-size: 13px; width: 180px;
+  }
+  #toolbar input#search::placeholder { color: #888; }
+  #toolbar .filters { display: flex; gap: 10px; font-size: 12px; }
+  #toolbar .filters label { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+  #toolbar .filters label span::before {
+    content: ""; display: inline-block; width: 10px; height: 10px;
+    margin-right: 2px; vertical-align: middle; border-radius: 2px;
+  }
   #toolbar .legend { display: flex; gap: 10px; margin-left: auto; font-size: 12px; }
   #toolbar .legend span::before {
     content: ""; display: inline-block; width: 10px; height: 10px;
@@ -30,6 +41,13 @@
 <div id="toolbar">
   <strong>__TITLE__</strong>
   <span id="counts"></span>
+  <input id="search" type="search" placeholder="search nodes…" autocomplete="off" spellcheck="false" />
+  <span class="filters">
+    <label><input type="checkbox" id="filter-data_flow" checked /><span class="e-data_flow">data-flow</span></label>
+    <label><input type="checkbox" id="filter-table_axis" checked /><span class="e-table_axis">table-axis</span></label>
+    <label><input type="checkbox" id="filter-hierarchy" checked /><span class="e-hierarchy">hierarchy</span></label>
+    <label><input type="checkbox" id="filter-schedule" checked /><span class="e-schedule">schedule</span></label>
+  </span>
   <span class="legend">
     <span class="e-data_flow">data-flow</span>
     <span class="e-table_axis">table-axis</span>
@@ -81,7 +99,7 @@ document.addEventListener("DOMContentLoaded", function () {
     return;
   }
 
-  cytoscape({
+  var cy = cytoscape({
     container: document.getElementById("cy"),
     elements: toElements(GRAPH),
     style: [
@@ -117,12 +135,58 @@ document.addEventListener("DOMContentLoaded", function () {
             return ele.data("kind") === "hierarchy" ? "dotted" : "solid";
           }
         }
+      },
+      {
+        // Search miss: dim a node (and its label) without removing it.
+        selector: "node.dimmed",
+        style: { "opacity": 0.15, "text-opacity": 0.15 }
+      },
+      {
+        // Edge kind toggled off: hide it entirely.
+        selector: "edge.filtered-out",
+        style: { "display": "none" }
       }
     ],
     // TODO(later): use the dagre/elk layout extensions for a layered DAG view
     // once they are vendored; "cose" ships with core Cytoscape and needs no
     // extra asset, so the scaffold defaults to it.
     layout: { name: "cose", animate: false, padding: 30 }
+  });
+
+  // --- Search: dim nodes whose label/id does not contain the query ---------
+  // M1 identifiers may contain spaces, so we match on the raw id/label as a
+  // substring (case-insensitive) rather than splitting on anything but ".".
+  var searchInput = document.getElementById("search");
+  function applySearch() {
+    var q = (searchInput.value || "").trim().toLowerCase();
+    if (!q) {
+      cy.nodes().removeClass("dimmed");
+      return;
+    }
+    cy.nodes().forEach(function (n) {
+      var id = (n.data("id") || "").toLowerCase();
+      var label = (n.data("label") || "").toLowerCase();
+      var hit = id.indexOf(q) !== -1 || label.indexOf(q) !== -1;
+      if (hit) { n.removeClass("dimmed"); } else { n.addClass("dimmed"); }
+    });
+  }
+  if (searchInput) { searchInput.addEventListener("input", applySearch); }
+
+  // --- Edge-kind filters: show/hide all edges of a given kind ---------------
+  var EDGE_KINDS = ["data_flow", "table_axis", "hierarchy", "schedule"];
+  function applyFilter(kind) {
+    var box = document.getElementById("filter-" + kind);
+    if (!box) { return; }
+    var edges = cy.edges('[kind = "' + kind + '"]');
+    if (box.checked) { edges.removeClass("filtered-out"); }
+    else { edges.addClass("filtered-out"); }
+  }
+  EDGE_KINDS.forEach(function (kind) {
+    var box = document.getElementById("filter-" + kind);
+    if (box) {
+      box.addEventListener("change", function () { applyFilter(kind); });
+      applyFilter(kind);
+    }
   });
 });
 </script>
