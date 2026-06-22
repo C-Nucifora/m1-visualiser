@@ -777,4 +777,205 @@ mod tests {
             "parsed CST should retain its source"
         );
     }
+
+    // --- M5: schedule edges + function-rate grouping ---------------------------
+    //
+    // A project with rated functions. `Ctrl` and `Aux` are both triggered at
+    // 100 Hz via `<Props SelectedTrigger="…Events.On 100Hz">` (which the symbol
+    // table parses into `call_rate_hz == 100.0`); `Slow` runs at 50 Hz. `Both`
+    // carries BOTH a 200 Hz call rate and a 1 Hz default log rate so the
+    // `call_rate_hz`-over-`log_rate_hz` preference can be asserted. `Init` has no
+    // resolvable rate (`On Startup`) and so must not get a schedule edge.
+    const SCHEDULE_PROJECT: &str = r#"<?xml version="1.0"?>
+<MoTeCM1BuildSession>
+ <Project Name="Demo" TargetHardware="ecu120">
+  <ComponentStream><List>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Engine"/>
+   <Component Classname="BuiltIn.FuncUser" Filename="Ctrl.m1scr" Name="Root.Engine.Ctrl"><Props SelectedTrigger="Parent.Parent.Events.On 100Hz"/></Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="Aux.m1scr" Name="Root.Engine.Aux"><Props SelectedTrigger="Parent.Parent.Events.On 100Hz"/></Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="Slow.m1scr" Name="Root.Engine.Slow"><Props SelectedTrigger="Parent.Parent.Events.On 50Hz"/></Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="Both.m1scr" Name="Root.Engine.Both"><Props SelectedTrigger="Parent.Parent.Events.On 200Hz" DefaultLogRate="1S"/></Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="Init.m1scr" Name="Root.Engine.Init"><Props SelectedTrigger="Parent.Parent.Events.On Startup"/></Component>
+  </List></ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>"#;
+
+    #[test]
+    fn function_rate_drives_schedule_edge() {
+        // A FuncUser whose `SelectedTrigger` resolves to a 100 Hz clock
+        // (`call_rate_hz == 100.0`) must be wired to a single `Clock@100Hz` node
+        // via a Schedule edge, oriented clock -> function ("this fn runs at this
+        // rate"). The clock id strips the trailing `.0` (100, not 100.0).
+        let project = Project::from_xml(SCHEDULE_PROJECT).unwrap();
+        let model = build_model(&project, None);
+
+        // The function node carries the call rate.
+        let ctrl = model
+            .nodes
+            .iter()
+            .find(|n| n.id == "Root.Engine.Ctrl")
+            .expect("Ctrl function node present");
+        assert_eq!(ctrl.kind, NodeKind::Function, "Ctrl is a function node");
+        assert_eq!(
+            ctrl.rate_hz,
+            Some(100.0),
+            "Ctrl's call_rate_hz reaches the node; got {:?}",
+            ctrl.rate_hz
+        );
+
+        // The synthetic clock node exists exactly once, with a stable id.
+        let clock_count = model
+            .nodes
+            .iter()
+            .filter(|n| n.id == "Clock@100Hz")
+            .count();
+        assert_eq!(
+            clock_count, 1,
+            "exactly one Clock@100Hz node; nodes = {:?}",
+            model.nodes
+        );
+
+        // The Schedule edge runs clock -> function.
+        assert!(
+            model.edges.iter().any(|e| e.from == "Clock@100Hz"
+                && e.to == "Root.Engine.Ctrl"
+                && e.kind == EdgeKind::Schedule),
+            "Clock@100Hz -> Root.Engine.Ctrl Schedule edge; edges = {:?}",
+            model.edges
+        );
+    }
+
+    #[test]
+    fn function_rate_prefers_call_rate_over_log_rate() {
+        // `Both` carries call_rate_hz == 200 and log_rate_hz == 1. `build_node`
+        // does `call_rate_hz.or(log_rate_hz)`, so the node's rate — and thus its
+        // clock — must be 200 Hz, never 1 Hz.
+        let project = Project::from_xml(SCHEDULE_PROJECT).unwrap();
+        let model = build_model(&project, None);
+
+        let both = model
+            .nodes
+            .iter()
+            .find(|n| n.id == "Root.Engine.Both")
+            .expect("Both function node present");
+        assert_eq!(
+            both.rate_hz,
+            Some(200.0),
+            "call_rate_hz (200) preferred over log_rate_hz (1); got {:?}",
+            both.rate_hz
+        );
+
+        // It is scheduled by the 200 Hz clock and never by a 1 Hz clock.
+        assert!(
+            model.edges.iter().any(|e| e.from == "Clock@200Hz"
+                && e.to == "Root.Engine.Both"
+                && e.kind == EdgeKind::Schedule),
+            "Clock@200Hz -> Both Schedule edge; edges = {:?}",
+            model.edges
+        );
+        assert!(
+            !model.edges.iter().any(|e| e.to == "Root.Engine.Both"
+                && e.from == "Clock@1Hz"
+                && e.kind == EdgeKind::Schedule),
+            "no 1 Hz clock edge to Both; edges = {:?}",
+            model.edges
+        );
+        assert!(
+            !model.nodes.iter().any(|n| n.id == "Clock@1Hz"),
+            "no spurious Clock@1Hz node; nodes = {:?}",
+            model.nodes
+        );
+    }
+
+    #[test]
+    fn two_nodes_same_rate_share_one_clock() {
+        // `Ctrl` and `Aux` both run at 100 Hz: they must share a single
+        // `Clock@100Hz` node (the clock is deduped by rate), each with its own
+        // Schedule edge from that one clock.
+        let project = Project::from_xml(SCHEDULE_PROJECT).unwrap();
+        let model = build_model(&project, None);
+
+        let clock_count = model
+            .nodes
+            .iter()
+            .filter(|n| n.id == "Clock@100Hz")
+            .count();
+        assert_eq!(
+            clock_count, 1,
+            "two 100 Hz nodes share ONE Clock@100Hz node; nodes = {:?}",
+            model.nodes
+        );
+
+        let from_100hz = |to: &str| {
+            model.edges.iter().any(|e| {
+                e.from == "Clock@100Hz" && e.to == to && e.kind == EdgeKind::Schedule
+            })
+        };
+        assert!(
+            from_100hz("Root.Engine.Ctrl"),
+            "Clock@100Hz -> Ctrl; edges = {:?}",
+            model.edges
+        );
+        assert!(
+            from_100hz("Root.Engine.Aux"),
+            "Clock@100Hz -> Aux; edges = {:?}",
+            model.edges
+        );
+
+        // Both edges hang off the single shared clock: exactly two Schedule edges
+        // originate from Clock@100Hz.
+        let edges_from_100hz = model
+            .edges
+            .iter()
+            .filter(|e| e.from == "Clock@100Hz" && e.kind == EdgeKind::Schedule)
+            .count();
+        assert_eq!(
+            edges_from_100hz, 2,
+            "both 100 Hz functions wire to the one clock; edges = {:?}",
+            model.edges
+        );
+    }
+
+    #[test]
+    fn unrated_nodes_have_no_schedule_edge() {
+        // `Init` triggers `On Startup`, which has no resolvable rate
+        // (`call_rate_hz == None`), and the bare Engine group has no rate either.
+        // Neither may receive a Schedule edge, and no clock exists for them.
+        let project = Project::from_xml(SCHEDULE_PROJECT).unwrap();
+        let model = build_model(&project, None);
+
+        // The Init node exists but carries no rate.
+        let init = model
+            .nodes
+            .iter()
+            .find(|n| n.id == "Root.Engine.Init")
+            .expect("Init function node present");
+        assert_eq!(
+            init.rate_hz, None,
+            "On Startup has no resolvable rate; got {:?}",
+            init.rate_hz
+        );
+
+        // No Schedule edge targets the unrated Init function or the Engine group.
+        assert!(
+            !model.edges.iter().any(|e| e.kind == EdgeKind::Schedule
+                && (e.to == "Root.Engine.Init" || e.to == "Root.Engine")),
+            "no schedule edge to unrated nodes; edges = {:?}",
+            model.edges
+        );
+
+        // Every Schedule edge points at a node that actually carries a rate.
+        for edge in model.edges.iter().filter(|e| e.kind == EdgeKind::Schedule) {
+            let target = model
+                .nodes
+                .iter()
+                .find(|n| n.id == edge.to)
+                .expect("schedule edge target is a real node");
+            assert!(
+                target.rate_hz.is_some(),
+                "schedule edge {:?} targets an unrated node",
+                edge
+            );
+        }
+    }
 }
