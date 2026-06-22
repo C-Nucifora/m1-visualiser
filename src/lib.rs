@@ -12,6 +12,7 @@
 //! and a numeric value overlay (via `m1-eval`) are deferred to later workflows;
 //! see the `TODO`s in [`loader`] and the design doc.
 
+pub mod dataflow;
 pub mod dot;
 pub mod html;
 pub mod json;
