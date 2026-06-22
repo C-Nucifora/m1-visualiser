@@ -539,6 +539,123 @@ mod tests {
         );
     }
 
+    // A project declaring a 2-D table `Root.Demo.Map` together with its
+    // auto-created members the real `.m1prj` exports carry: the `.Value`
+    // interpolated-output channel and the axis breakpoint channels nested under
+    // the table path. The `.m1cfg` (TABLE_CONFIG) supplies the 2-D shape. This is
+    // the shape the M4 table-axis edges hang off — members are real symbols the
+    // project declares, never synthesized by the cfg.
+    const TABLE_WITH_MEMBERS_PROJECT: &str = r#"<?xml version="1.0"?>
+<MoTeCM1BuildSession>
+ <Project Name="Demo" TargetHardware="ecu120">
+  <ComponentStream><List>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Demo"/>
+   <Component Classname="BuiltIn.Table" Name="Root.Demo.Map"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Demo.Map.Value" Caps="AutoCreated"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Demo.Map.X" Caps="AutoCreated"><Props Type="f32"><Locale><Default Unit="rpm"/></Locale></Props></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Demo.Map.Y" Caps="AutoCreated"><Props Type="f32"><Locale><Default Unit="%"/></Locale></Props></Component>
+  </List></ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>"#;
+
+    #[test]
+    fn table_axis_links_members_and_marks_dims() {
+        // With the 2-D `.m1cfg` shape applied, the table node must record
+        // `table_dims == Some(2)`, and TableAxis edges must fan out from the
+        // table (the hub) to each of its members — the `.Value` output channel
+        // and the axis breakpoint channels nested under the table path.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let prj = dir.path().join("Project.m1prj");
+        let cfg = dir.path().join("parameters.m1cfg");
+        std::fs::write(&prj, TABLE_WITH_MEMBERS_PROJECT).expect("write project");
+        std::fs::write(&cfg, TABLE_CONFIG).expect("write config");
+
+        let model = load(&prj, Some(&cfg), Some("Demo".into())).expect("project should load");
+
+        let table = model
+            .nodes
+            .iter()
+            .find(|n| n.id == "Root.Demo.Map")
+            .expect("table node present");
+        assert_eq!(table.kind, NodeKind::Table, "Root.Demo.Map is a table node");
+        assert_eq!(
+            table.table_dims,
+            Some(2),
+            "2-D table from .m1cfg should give table_dims == Some(2); got {:?}",
+            table.table_dims
+        );
+
+        // Edges are oriented table -> member (the table is the hub).
+        let axis_edge_to = |member: &str| {
+            model.edges.iter().any(|e| {
+                e.kind == EdgeKind::TableAxis && e.from == "Root.Demo.Map" && e.to == member
+            })
+        };
+        assert!(
+            axis_edge_to("Root.Demo.Map.Value"),
+            "table -> .Value output channel edge present; edges = {:?}",
+            model.edges
+        );
+        assert!(
+            axis_edge_to("Root.Demo.Map.X"),
+            "table -> X axis channel edge present; edges = {:?}",
+            model.edges
+        );
+        assert!(
+            axis_edge_to("Root.Demo.Map.Y"),
+            "table -> Y axis channel edge present; edges = {:?}",
+            model.edges
+        );
+        // No reverse-oriented (member -> table) TableAxis edge leaks in.
+        assert!(
+            !model
+                .edges
+                .iter()
+                .any(|e| e.kind == EdgeKind::TableAxis && e.to == "Root.Demo.Map"),
+            "no member -> table edge; edges = {:?}",
+            model.edges
+        );
+        // Exactly the three members are linked.
+        assert_eq!(
+            model.edge_count(EdgeKind::TableAxis),
+            3,
+            "exactly one TableAxis edge per member; edges = {:?}",
+            model.edges
+        );
+    }
+
+    #[test]
+    fn table_with_no_members_has_no_axis_edges() {
+        // A table whose members are absent (only the bare table symbol exists)
+        // must emit no spurious TableAxis edges and must not panic. TABLE_PROJECT
+        // declares `Root.Demo.Map` with no `.Value` / axis children.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let prj = dir.path().join("Project.m1prj");
+        let cfg = dir.path().join("parameters.m1cfg");
+        std::fs::write(&prj, TABLE_PROJECT).expect("write project");
+        std::fs::write(&cfg, TABLE_CONFIG).expect("write config");
+
+        let model = load(&prj, Some(&cfg), Some("Demo".into())).expect("project should load");
+
+        // The table node still exists and still records its dimensionality from
+        // the cfg, even with no member nodes to link.
+        assert!(
+            model
+                .nodes
+                .iter()
+                .any(|n| n.id == "Root.Demo.Map" && n.table_dims == Some(2)),
+            "table node present with dims; nodes = {:?}",
+            model.nodes
+        );
+        // But no TableAxis edge is emitted for it (no member nodes exist).
+        assert_eq!(
+            model.edge_count(EdgeKind::TableAxis),
+            0,
+            "no table-axis edges without members; edges = {:?}",
+            model.edges
+        );
+    }
+
     // A project shaped like the smoke fixture: an Engine group with Speed +
     // Limited channels, a MaxSpeed parameter, and a Limiter function backed by
     // `Limiter.m1scr`. Used to exercise real data-flow edges.
