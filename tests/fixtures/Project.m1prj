@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<MoTeCM1BuildSession>
+ <Project Name="Synthetic" TargetHardware="ecu120">
+  <ComponentStream><List>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Engine"/>
+   <Component Classname="BuiltIn.Channel" Name="Root.Engine.Speed"><Props Type="f32"><Locale><Default Unit="rpm"/></Locale></Props></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Engine.Limited"><Props Type="f32"><Locale><Default Unit="rpm"/></Locale></Props></Component>
+   <Component Classname="BuiltIn.Parameter" Name="Root.Engine.MaxSpeed.Value"><Props Type="u16" Security="Tune"/></Component>
+   <Component Classname="BuiltIn.Constant" Name="Root.Engine.IdleRpm"><Props Type="u16"/></Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="Limiter.m1scr" Name="Root.Engine.Limiter"/>
+  </List></ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>
