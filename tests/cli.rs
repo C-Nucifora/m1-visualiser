@@ -13,6 +13,53 @@ fn fixture_project() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/Project.m1prj")
 }
 
+/// Path to the overlay fixture project (a `Root.Demo` group with
+/// `Speed`/`Gain`/`Output` and an `Update` function computing
+/// `Output = Speed * Gain`) used by the value/diff overlay CLI tests.
+fn overlay_project() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/overlay/Project.m1prj")
+}
+
+/// A `function` scenario over `Demo.Update` with Speed=20, Gain=2.5, so
+/// `Output = 50.0` every tick — a known value for the overlay assertions.
+const OVERLAY_SCENARIO_TOML: &str = r#"
+mode = "function"
+target = "Demo.Update"
+duration_s = 0.03
+base_rate_hz = 100.0
+
+[[inputs]]
+channel = "Root.Demo.Speed"
+const = 20.0
+
+[[inputs]]
+channel = "Root.Demo.Gain"
+const = 2.5
+"#;
+
+/// A `time`-first CSV log consistent with Gain=2.5 (`Output = Speed * 2.5`).
+const OVERLAY_LOG_CSV: &str = "time,Root.Demo.Speed,Root.Demo.Output\n\
+                               0.00,20,50\n\
+                               0.01,20,50\n";
+
+/// Read the GraphModel JSON embedded in a rendered HTML page (the renderer
+/// substitutes it into the `var GRAPH = <json>;` literal), so a test can assert
+/// on the overlay the viewer will read. Returns the parsed JSON document.
+fn embedded_graph_json(html: &str) -> serde_json::Value {
+    // The template embeds the model as `var GRAPH = <compact json>;`. The compact
+    // JSON has no internal `;`, so slicing the assignment to its terminating `;`
+    // recovers exactly the document (matches `html.rs`'s own embedding guard).
+    let assign = html
+        .split("\nvar GRAPH =")
+        .nth(1)
+        .expect("page embeds a GRAPH assignment");
+    let literal = assign
+        .split(';')
+        .next()
+        .expect("GRAPH assignment terminated");
+    serde_json::from_str(literal.trim()).expect("embedded GRAPH JSON parses")
+}
+
 /// A 2-D table project + its `.m1cfg` (mirrors the loader's
 /// `TABLE_WITH_MEMBERS_PROJECT` / `TABLE_CONFIG`). The cfg supplies the table's
 /// 2-D shape so the table node records `table_dims == 2` once threaded through.
@@ -236,6 +283,248 @@ fn cli_unreadable_project_exits_one() {
         .expect("binary builds")
         .arg("--project")
         .arg(&bogus)
+        .assert()
+        .failure()
+        .code(1);
+}
+
+// ---- O6: opt-in overlay flags, back-compatible ----
+
+#[test]
+fn cli_without_overlay_is_unchanged() {
+    // With no overlay flag the binary is the v1 tool: the HTML it writes carries
+    // no `"overlay"` in its embedded GraphModel JSON (the back-compat invariant).
+    let dir = tempfile::tempdir().expect("temp dir");
+    let html = dir.path().join("graph.html");
+
+    Command::cargo_bin("m1-visualiser")
+        .expect("binary builds")
+        .arg("--project")
+        .arg(overlay_project())
+        .arg("--out")
+        .arg(&html)
+        .assert()
+        .success();
+
+    let page = std::fs::read_to_string(&html).expect("html written");
+    let graph = embedded_graph_json(&page);
+    assert!(
+        graph.get("overlay").is_none(),
+        "no overlay flag must embed no overlay; got {graph}"
+    );
+}
+
+#[test]
+fn cli_overlay_scenario_embeds_values() {
+    // `--overlay-scenario <scn.toml>` runs a VALUE overlay and embeds it: the
+    // page's GraphModel JSON gains `"overlay"` with `"kind":"value"` and a node
+    // series carrying the known computed value (Output = 20 * 2.5 = 50).
+    let dir = tempfile::tempdir().expect("temp dir");
+    let scn = dir.path().join("scenario.toml");
+    std::fs::write(&scn, OVERLAY_SCENARIO_TOML).expect("write scenario");
+    let html = dir.path().join("graph.html");
+
+    Command::cargo_bin("m1-visualiser")
+        .expect("binary builds")
+        .arg("--project")
+        .arg(overlay_project())
+        .arg("--overlay-scenario")
+        .arg(&scn)
+        .arg("--out")
+        .arg(&html)
+        .assert()
+        .success();
+
+    let page = std::fs::read_to_string(&html).expect("html written");
+    let graph = embedded_graph_json(&page);
+    let overlay = &graph["overlay"];
+    assert_eq!(overlay["kind"], "value", "scenario yields a value overlay");
+    // The Output node carries a numeric series ending at 50.0.
+    let series = overlay["nodes"]["Root.Demo.Output"]["series"]
+        .as_array()
+        .expect("Output node has a series");
+    let last = series.last().expect("series is non-empty");
+    assert_eq!(last["num"], 50.0, "Output's last cell is 50.0; got {last}");
+}
+
+#[test]
+fn cli_overlay_log_embeds_values() {
+    // `--overlay-log <log.csv>` (no override) produces a VALUE overlay (the
+    // identity replay): `"kind":"value"`, the logged Speed channel present, and
+    // no changed cone.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let log = dir.path().join("run.csv");
+    std::fs::write(&log, OVERLAY_LOG_CSV).expect("write log");
+    let html = dir.path().join("graph.html");
+
+    Command::cargo_bin("m1-visualiser")
+        .expect("binary builds")
+        .arg("--project")
+        .arg(overlay_project())
+        .arg("--overlay-log")
+        .arg(&log)
+        .arg("--out")
+        .arg(&html)
+        .assert()
+        .success();
+
+    let page = std::fs::read_to_string(&html).expect("html written");
+    let graph = embedded_graph_json(&page);
+    let overlay = &graph["overlay"];
+    assert_eq!(
+        overlay["kind"], "value",
+        "a log without override is value mode"
+    );
+    assert!(
+        overlay["nodes"].get("Root.Demo.Speed").is_some(),
+        "the logged Speed channel rides into the overlay; got {overlay}"
+    );
+    assert!(
+        overlay["changed"]
+            .as_array()
+            .expect("changed array")
+            .is_empty(),
+        "identity replay flags nothing changed; got {}",
+        overlay["changed"]
+    );
+}
+
+#[test]
+fn cli_overlay_diff_marks_changed() {
+    // `--overlay-log <log.csv> --override "Root.Demo.Speed=40.0"` recomputes the
+    // override's downstream cone: the overlay is `"kind":"diff"` and its `changed`
+    // set names the moved Output channel.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let log = dir.path().join("run.csv");
+    std::fs::write(&log, OVERLAY_LOG_CSV).expect("write log");
+    let html = dir.path().join("graph.html");
+
+    Command::cargo_bin("m1-visualiser")
+        .expect("binary builds")
+        .arg("--project")
+        .arg(overlay_project())
+        .arg("--overlay-log")
+        .arg(&log)
+        .arg("--override")
+        .arg("Root.Demo.Speed=40.0")
+        .arg("--out")
+        .arg(&html)
+        .assert()
+        .success();
+
+    let page = std::fs::read_to_string(&html).expect("html written");
+    let graph = embedded_graph_json(&page);
+    let overlay = &graph["overlay"];
+    assert_eq!(overlay["kind"], "diff", "an override switches to diff mode");
+    let changed: Vec<&str> = overlay["changed"]
+        .as_array()
+        .expect("changed array")
+        .iter()
+        .map(|v| v.as_str().expect("changed id is a string"))
+        .collect();
+    assert!(
+        changed.contains(&"Root.Demo.Output"),
+        "the overridden cone must include Output; got {changed:?}"
+    );
+}
+
+#[test]
+fn cli_at_time_selects_tick() {
+    // `--at-time 0.0` records the chosen default scrubber tick (nearest to 0.0,
+    // i.e. the first tick = index 0) in the overlay JSON as `start_tick`, so the
+    // viewer opens there. The full series is still embedded.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let log = dir.path().join("run.csv");
+    std::fs::write(&log, OVERLAY_LOG_CSV).expect("write log");
+    let html = dir.path().join("graph.html");
+
+    Command::cargo_bin("m1-visualiser")
+        .expect("binary builds")
+        .arg("--project")
+        .arg(overlay_project())
+        .arg("--overlay-log")
+        .arg(&log)
+        .arg("--at-time")
+        .arg("0.0")
+        .arg("--out")
+        .arg(&html)
+        .assert()
+        .success();
+
+    let page = std::fs::read_to_string(&html).expect("html written");
+    let graph = embedded_graph_json(&page);
+    let overlay = &graph["overlay"];
+    assert_eq!(
+        overlay["start_tick"], 0,
+        "--at-time 0.0 selects the first tick; got {}",
+        overlay["start_tick"]
+    );
+}
+
+#[test]
+fn cli_overlay_requires_log_for_override() {
+    // `--override` without `--overlay-log` is a usage error: fail loud (non-zero),
+    // never silently produce a value overlay.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let html = dir.path().join("graph.html");
+
+    Command::cargo_bin("m1-visualiser")
+        .expect("binary builds")
+        .arg("--project")
+        .arg(overlay_project())
+        .arg("--override")
+        .arg("Root.Demo.Speed=40.0")
+        .arg("--out")
+        .arg(&html)
+        .assert()
+        .failure();
+}
+
+#[test]
+fn cli_overlay_scenario_and_log_are_mutually_exclusive() {
+    // The two overlay sources are xor: requesting both must fail loud, never
+    // silently pick one.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let scn = dir.path().join("scenario.toml");
+    std::fs::write(&scn, OVERLAY_SCENARIO_TOML).expect("write scenario");
+    let log = dir.path().join("run.csv");
+    std::fs::write(&log, OVERLAY_LOG_CSV).expect("write log");
+    let html = dir.path().join("graph.html");
+
+    Command::cargo_bin("m1-visualiser")
+        .expect("binary builds")
+        .arg("--project")
+        .arg(overlay_project())
+        .arg("--overlay-scenario")
+        .arg(&scn)
+        .arg("--overlay-log")
+        .arg(&log)
+        .arg("--out")
+        .arg(&html)
+        .assert()
+        .failure();
+}
+
+#[test]
+fn cli_ld_log_without_feature_fails_loud() {
+    // A `.ld` overlay log built without `--features ld` must exit non-zero (the
+    // engine fails loud, naming the feature). This test runs against whatever the
+    // default build is; under `--features ld` the `.ld` path is enabled and the
+    // engine would instead fail on the file's contents, so the assertion is just
+    // "non-zero exit" either way (a bogus `.ld` never succeeds).
+    let dir = tempfile::tempdir().expect("temp dir");
+    let log = dir.path().join("run.ld");
+    std::fs::write(&log, "not a real ld file").expect("write bogus ld");
+    let html = dir.path().join("graph.html");
+
+    Command::cargo_bin("m1-visualiser")
+        .expect("binary builds")
+        .arg("--project")
+        .arg(overlay_project())
+        .arg("--overlay-log")
+        .arg(&log)
+        .arg("--out")
+        .arg(&html)
         .assert()
         .failure()
         .code(1);
