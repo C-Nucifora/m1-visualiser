@@ -258,6 +258,28 @@ impl GraphModel {
     pub fn edge_count(&self, kind: EdgeKind) -> usize {
         self.edges.iter().filter(|e| e.kind == kind).count()
     }
+
+    /// Fold an [`Overlay`] onto this model and return it, leaving `nodes`/`edges`
+    /// byte-identical and setting `overlay = Some(overlay)`.
+    ///
+    /// This is the model-side join seam: the `eval` boundary module (the only
+    /// `m1-eval`-aware code) builds the [`Overlay`] keyed by node id, and this
+    /// pure-model method attaches it — so mutating the model never pulls in
+    /// `m1-eval`. The CLI flow is:
+    ///
+    /// ```text
+    /// let model = loader::load(...)?;
+    /// let overlay = eval::run_value_scenario(...)?;
+    /// let model = model.with_overlay(overlay);
+    /// ```
+    ///
+    /// Attaching is an idempotent replacement: a second call supersedes the first
+    /// (the last overlay wins), never accumulating.
+    #[must_use]
+    pub fn with_overlay(mut self, overlay: Overlay) -> Self {
+        self.overlay = Some(overlay);
+        self
+    }
 }
 
 #[cfg(test)]
@@ -376,6 +398,76 @@ mod tests {
             let back: OverlayCell = serde_json::from_str(&json).unwrap();
             assert_eq!(cell, back);
         }
+    }
+
+    /// A small helper: a value overlay carrying a single numeric node series, so
+    /// the attach tests have a concrete `Overlay` to fold on.
+    fn sample_overlay(node_id: &str, value: f64) -> Overlay {
+        let mut nodes = BTreeMap::new();
+        nodes.insert(
+            node_id.to_string(),
+            NodeOverlay {
+                series: vec![OverlayCell::Num(value)],
+                delta: None,
+                max_abs_delta: None,
+            },
+        );
+        Overlay {
+            kind: OverlayKind::Value,
+            time: vec![0.0],
+            nodes,
+            external: BTreeSet::new(),
+            changed: Vec::new(),
+            eps: None,
+        }
+    }
+
+    #[test]
+    fn attach_sets_overlay_and_preserves_structure() {
+        // Folding an overlay onto a model sets `overlay = Some(_)` while leaving
+        // the structural `nodes`/`edges` byte-identical (the join must not touch
+        // structure — `eval.rs` owns the values, the model just carries them).
+        let mut g = GraphModel::new(Some("Demo".into()));
+        g.nodes
+            .push(GraphNode::new("Root.Demo.Output", NodeKind::Channel));
+        g.nodes
+            .push(GraphNode::new("Root.Demo.Speed", NodeKind::Channel));
+        g.edges.push(GraphEdge::new(
+            "Root.Demo.Speed",
+            "Root.Demo.Output",
+            EdgeKind::DataFlow,
+        ));
+        let nodes_before = g.nodes.clone();
+        let edges_before = g.edges.clone();
+        let title_before = g.title.clone();
+
+        let overlay = sample_overlay("Root.Demo.Output", 50.0);
+        let g = g.with_overlay(overlay.clone());
+
+        assert_eq!(g.overlay, Some(overlay));
+        assert_eq!(g.nodes, nodes_before, "attach must not touch nodes");
+        assert_eq!(g.edges, edges_before, "attach must not touch edges");
+        assert_eq!(g.title, title_before, "attach must not touch the title");
+    }
+
+    #[test]
+    fn attach_is_idempotent_replacement() {
+        // Attaching twice replaces, never appends — the last overlay wins. This
+        // keeps the CLI flow simple: re-running an overlay just supersedes.
+        let mut g = GraphModel::new(Some("Demo".into()));
+        g.nodes
+            .push(GraphNode::new("Root.Demo.Output", NodeKind::Channel));
+
+        let first = sample_overlay("Root.Demo.Output", 10.0);
+        let second = sample_overlay("Root.Demo.Output", 99.0);
+
+        let g = g.with_overlay(first).with_overlay(second.clone());
+
+        assert_eq!(
+            g.overlay,
+            Some(second),
+            "the second attach must replace the first (last overlay wins)"
+        );
     }
 
     #[test]
