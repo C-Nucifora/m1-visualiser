@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>__TITLE__ — m1-visualiser</title>
+<style>
+  html, body { margin: 0; height: 100%; font-family: Helvetica, Arial, sans-serif; }
+  #toolbar {
+    position: fixed; top: 0; left: 0; right: 0; height: 40px;
+    display: flex; align-items: center; gap: 12px; padding: 0 12px;
+    background: #1e1e24; color: #eee; font-size: 14px; z-index: 10;
+  }
+  #toolbar strong { font-weight: 600; }
+  #toolbar .legend { display: flex; gap: 10px; margin-left: auto; font-size: 12px; }
+  #toolbar .legend span::before {
+    content: ""; display: inline-block; width: 10px; height: 10px;
+    margin-right: 4px; vertical-align: middle; border-radius: 2px;
+  }
+  .e-data_flow::before  { background: #222; }
+  .e-table_axis::before { background: #8e44ad; }
+  .e-hierarchy::before  { background: #e67e22; }
+  .e-schedule::before   { background: #c0392b; }
+  #cy { position: absolute; top: 40px; bottom: 0; left: 0; right: 0; }
+</style>
+<script>/*__CYTOSCAPE_JS__*/</script>
+</head>
+<body>
+<div id="toolbar">
+  <strong>__TITLE__</strong>
+  <span id="counts"></span>
+  <span class="legend">
+    <span class="e-data_flow">data-flow</span>
+    <span class="e-table_axis">table-axis</span>
+    <span class="e-hierarchy">hierarchy</span>
+    <span class="e-schedule">schedule</span>
+  </span>
+</div>
+<div id="cy"></div>
+<script>
+// The project's structural graph, embedded at generation time.
+var GRAPH = /*__GRAPH_JSON__*/ {"nodes":[],"edges":[]};
+
+// Map a node to a fill colour by kind.
+var NODE_COLOR = {
+  channel: "#34495e", parameter: "#2980b9", constant: "#7f8c8d",
+  table: "#8e44ad", function: "#27ae60", group: "#e67e22"
+};
+var EDGE_COLOR = {
+  data_flow: "#222", table_axis: "#8e44ad", hierarchy: "#e67e22", schedule: "#c0392b"
+};
+
+function toElements(graph) {
+  var els = [];
+  (graph.nodes || []).forEach(function (n) {
+    var label = (n.path || n.id).split(".").pop();
+    if (n.rate_hz != null) { label += "\n" + n.rate_hz + " Hz"; }
+    else if (n.unit) { label += "\n[" + n.unit + "]"; }
+    var data = { id: n.id, label: label, kind: n.kind };
+    // Compound nesting: a node's parent group becomes its Cytoscape parent,
+    // but only when that parent is itself a group node in the graph.
+    if (n.parent) { data.parent = n.parent; }
+    els.push({ data: data });
+  });
+  (graph.edges || []).forEach(function (e, i) {
+    els.push({ data: { id: "e" + i, source: e.from, target: e.to, kind: e.kind } });
+  });
+  return els;
+}
+
+document.addEventListener("DOMContentLoaded", function () {
+  var nodeCount = (GRAPH.nodes || []).length;
+  var edgeCount = (GRAPH.edges || []).length;
+  document.getElementById("counts").textContent =
+    nodeCount + " nodes · " + edgeCount + " edges";
+
+  if (typeof cytoscape === "undefined") {
+    document.getElementById("cy").textContent =
+      "Cytoscape.js failed to load — the graph cannot be rendered.";
+    return;
+  }
+
+  cytoscape({
+    container: document.getElementById("cy"),
+    elements: toElements(GRAPH),
+    style: [
+      {
+        selector: "node",
+        style: {
+          "label": "data(label)", "text-wrap": "wrap", "font-size": 10,
+          "text-valign": "center", "color": "#fff",
+          "background-color": function (ele) {
+            return NODE_COLOR[ele.data("kind")] || "#555";
+          },
+          "width": "label", "height": "label",
+          "padding": "6px", "shape": "round-rectangle"
+        }
+      },
+      {
+        // Compound (group) parent nodes: a translucent box with the label on top.
+        selector: ":parent",
+        style: {
+          "background-opacity": 0.12, "background-color": "#e67e22",
+          "border-width": 1, "border-color": "#e67e22",
+          "text-valign": "top", "color": "#e67e22", "font-size": 11
+        }
+      },
+      {
+        selector: "edge",
+        style: {
+          "width": 1.5, "curve-style": "bezier",
+          "target-arrow-shape": "triangle",
+          "line-color": function (ele) { return EDGE_COLOR[ele.data("kind")] || "#888"; },
+          "target-arrow-color": function (ele) { return EDGE_COLOR[ele.data("kind")] || "#888"; },
+          "line-style": function (ele) {
+            return ele.data("kind") === "hierarchy" ? "dotted" : "solid";
+          }
+        }
+      }
+    ],
+    // TODO(later): use the dagre/elk layout extensions for a layered DAG view
+    // once they are vendored; "cose" ships with core Cytoscape and needs no
+    // extra asset, so the scaffold defaults to it.
+    layout: { name: "cose", animate: false, padding: 30 }
+  });
+});
+</script>
+</body>
+</html>
