@@ -15,7 +15,7 @@ fn fixture_project() -> PathBuf {
 
 #[test]
 fn builds_nonempty_graph_from_fixture() {
-    let model = loader::load(&fixture_project(), Some("Synthetic".into()))
+    let model = loader::load(&fixture_project(), None, Some("Synthetic".into()))
         .expect("fixture project should load");
 
     // Nodes and edges are produced.
@@ -47,7 +47,7 @@ fn builds_nonempty_graph_from_fixture() {
 
 #[test]
 fn dot_and_json_render_from_fixture() {
-    let model = loader::load(&fixture_project(), Some("Synthetic".into()))
+    let model = loader::load(&fixture_project(), None, Some("Synthetic".into()))
         .expect("fixture project should load");
 
     // DOT renders a well-formed digraph mentioning a fixture node.
@@ -76,7 +76,7 @@ fn dot_and_json_render_from_fixture() {
 
 #[test]
 fn html_render_is_self_contained() {
-    let model = loader::load(&fixture_project(), Some("Synthetic".into()))
+    let model = loader::load(&fixture_project(), None, Some("Synthetic".into()))
         .expect("fixture project should load");
 
     let page = html::render(&model);

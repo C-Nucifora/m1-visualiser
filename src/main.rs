@@ -83,7 +83,7 @@ fn main() {
             .map(|n| n.to_string_lossy().into_owned())
     });
 
-    let model = match loader::load(&project_path, title) {
+    let model = match loader::load(&project_path, None, title) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("m1-visualiser: {}: {e}", project_path.display());

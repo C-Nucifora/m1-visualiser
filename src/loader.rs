@@ -18,14 +18,20 @@
 //! - **Schedule edges** linking a function/scheduled node to a synthetic clock
 //!   node for its `call_rate_hz`.
 //!
+//! `load` also ingests the optional `.m1cfg` (for `table_meta`) and discovers
+//! the project's `*.m1scr` scripts (parsed once via `parse_all`), threading them
+//! into the model for the data-flow pass.
+//!
 //! `DataFlow` edges require per-script CST read/write analysis and are stubbed —
 //! see [`add_data_flow_edges`].
 
 use crate::model::{EdgeKind, GraphEdge, GraphModel, GraphNode, NodeKind};
 use m1_typecheck::Project;
+use m1_typecheck::parsed::{ParsedScript, parse_all};
 use m1_typecheck::symbols::{Symbol, SymbolKind};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::path::Path;
 
 /// Map an `m1-typecheck` symbol kind to a [`NodeKind`]. Returns `None` for kinds
 /// the structural graph does not surface as nodes (references, opaque objects,
@@ -87,16 +93,81 @@ fn build_node(sym: &Symbol, kind: NodeKind) -> GraphNode {
 
 /// Load a project file and build its graph model. Keeps all `m1-typecheck` I/O
 /// inside the loader so the rest of the crate stays toolchain-agnostic.
+///
+/// `project_path` points at the `.m1prj`. `config_path`, when given, is loaded
+/// into the project via [`Project::with_config`] so the `.m1cfg`'s table /
+/// parameter **shape** (notably `table_meta`, which drives `table_dims`) reaches
+/// the graph. Scripts are discovered by walking the project file's parent
+/// directory recursively for `*.m1scr` and parsed once via `parse_all`; they are
+/// threaded into the model for the (currently no-op) data-flow pass.
 pub fn load(
-    project_path: &std::path::Path,
+    project_path: &Path,
+    config_path: Option<&Path>,
     title: Option<String>,
 ) -> Result<GraphModel, m1_typecheck::project::LoadError> {
-    let project = Project::load(project_path)?;
-    Ok(build_model(&project, title))
+    let mut project = Project::load(project_path)?;
+
+    // Augment the project with the cfg's table/parameter shape if provided. This
+    // is what populates `Symbol::table_meta`, used for `table_dims`.
+    if let Some(cfg) = config_path {
+        project = project.with_config(cfg)?;
+    }
+
+    // Discover scripts relative to the project file's directory (mirrors m1-doc
+    // and m1-eval's loader), parsing each `.m1scr` exactly once.
+    let project_dir = project_path.parent().unwrap_or_else(|| Path::new("."));
+    let pairs = collect_scripts(project_dir);
+    let scripts = parse_all(&pairs);
+
+    Ok(build_model_with_scripts(&project, &scripts, title))
 }
 
-/// Build the structural graph model from an already-loaded project.
+/// Collect every `.m1scr` under `dir` (recursively) as `(basename, source)`
+/// pairs, sorted deterministically by basename. Sources are lossy-UTF-8 decoded
+/// so Windows-1252 exports do not abort discovery. Ported from
+/// `m1-eval/src/loader.rs` (same project, GPL-3.0-or-later).
+fn collect_scripts(dir: &Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    collect_scripts_rec(dir, &mut out);
+    // Deterministic order: sort by basename so the graph (and any traces) are
+    // reproducible regardless of filesystem enumeration order.
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+fn collect_scripts_rec(dir: &Path, out: &mut Vec<(String, String)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_scripts_rec(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("m1scr") {
+            let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+                continue;
+            };
+            let bytes = std::fs::read(&path).unwrap_or_default();
+            let source = String::from_utf8_lossy(&bytes).into_owned();
+            out.push((name, source));
+        }
+    }
+}
+
+/// Build the structural graph model from an already-loaded project, with no
+/// discovered scripts. Retained for callers/tests that only have a `Project`;
+/// delegates to [`build_model_with_scripts`] with an empty slice.
 pub fn build_model(project: &Project, title: Option<String>) -> GraphModel {
+    build_model_with_scripts(project, &[], title)
+}
+
+/// Build the structural graph model from an already-loaded project and its
+/// parsed scripts. The scripts feed the data-flow pass (currently a no-op).
+pub fn build_model_with_scripts(
+    project: &Project,
+    scripts: &[ParsedScript],
+    title: Option<String>,
+) -> GraphModel {
     let mut model = GraphModel::new(title);
 
     // 1. Nodes from symbols, plus the set of group paths we've seen explicitly.
@@ -129,7 +200,7 @@ pub fn build_model(project: &Project, title: Option<String>) -> GraphModel {
     add_schedule_edges(&mut model);
 
     // 6. Data-flow edges (stubbed — see the function).
-    add_data_flow_edges(project, &mut model);
+    add_data_flow_edges(project, scripts, &mut model);
 
     sort_for_determinism(&mut model);
     model
@@ -267,8 +338,9 @@ fn format_rate(rate: f64) -> String {
 /// Workflow 3) rather than re-deriving the analysis here.
 ///
 /// For now this is intentionally a no-op so the structural scaffold compiles and
-/// the other three edge types are exercised end to end.
-fn add_data_flow_edges(_project: &Project, _model: &mut GraphModel) {
+/// the other three edge types are exercised end to end. The parsed `scripts`
+/// slice is already threaded in (M1) ready for the real walker (M2/M3).
+fn add_data_flow_edges(_project: &Project, _scripts: &[ParsedScript], _model: &mut GraphModel) {
     // Intentionally empty in the scaffold. See the doc comment above.
 }
 
@@ -377,6 +449,87 @@ mod tests {
         assert!(
             model.edge_count(EdgeKind::Hierarchy) > 0,
             "expected hierarchy edges"
+        );
+    }
+
+    // A project declaring a table symbol, plus a `.m1cfg` giving it a 2-D shape.
+    // Real `.m1cfg` exports drop the implicit `Root.` prefix the symbol table
+    // keys use, so the cfg names the table `Demo.Map` and m1-typecheck resolves
+    // it back onto `Root.Demo.Map`.
+    const TABLE_PROJECT: &str = r#"<?xml version="1.0"?>
+<MoTeCM1BuildSession>
+ <Project Name="Demo" TargetHardware="ecu120">
+  <ComponentStream><List>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Demo"/>
+   <Component Classname="BuiltIn.Table" Name="Root.Demo.Map"><Props Type="f32"/></Component>
+  </List></ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>"#;
+
+    const TABLE_CONFIG: &str = r#"<?xml version="1.0"?>
+<Configuration Locale="English_Australia.1252" DefaultLocale="C">
+ <Group Name="">
+  <Table Name="Demo.Map">
+   <X><Cells Type="f32" Unit="rpm"><Cell>0</Cell><Cell>100</Cell></Cells></X>
+   <Y><Cells Type="f32" Unit="%"><Cell>0</Cell><Cell>1</Cell></Cells></Y>
+   <Body><Cells Type="f32"><Cell>10</Cell><Cell>20</Cell><Cell>30</Cell><Cell>40</Cell></Cells></Body>
+  </Table>
+ </Group>
+</Configuration>"#;
+
+    #[test]
+    fn load_with_config_populates_table_meta() {
+        // Write the project + cfg to a temp dir and load via the public `load`
+        // entry point, which threads the cfg into the project's symbol table.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let prj = dir.path().join("Project.m1prj");
+        let cfg = dir.path().join("parameters.m1cfg");
+        std::fs::write(&prj, TABLE_PROJECT).expect("write project");
+        std::fs::write(&cfg, TABLE_CONFIG).expect("write config");
+
+        let model = load(&prj, Some(&cfg), Some("Demo".into())).expect("project should load");
+
+        let table = model
+            .nodes
+            .iter()
+            .find(|n| n.id == "Root.Demo.Map")
+            .expect("table node present");
+        assert_eq!(
+            table.kind,
+            NodeKind::Table,
+            "Root.Demo.Map should be a table node"
+        );
+        // The 2-D cfg shape (X + Y axes) must reach the node as table_dims == 2.
+        assert_eq!(
+            table.table_dims,
+            Some(2),
+            "2-D table from .m1cfg should give table_dims == Some(2); got {:?}",
+            table.table_dims
+        );
+    }
+
+    #[test]
+    fn collect_scripts_finds_m1scr() {
+        // A project dir with one `.m1scr` should yield exactly one parsed script
+        // with the right name and a non-empty source.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let prj = dir.path().join("Project.m1prj");
+        std::fs::write(&prj, TABLE_PROJECT).expect("write project");
+        let scr = dir.path().join("Update.m1scr");
+        std::fs::write(&scr, "Output = 1;\n").expect("write script");
+
+        let pairs = collect_scripts(dir.path());
+        assert_eq!(pairs.len(), 1, "exactly one .m1scr discovered; got {pairs:?}");
+        assert_eq!(pairs[0].0, "Update.m1scr", "discovered by basename");
+        assert!(!pairs[0].1.is_empty(), "source should be non-empty");
+
+        // And the same discovery, parsed, surfaces through the public loader.
+        let scripts = parse_all(&pairs);
+        assert_eq!(scripts.len(), 1, "one parsed script");
+        assert_eq!(scripts[0].name, "Update.m1scr");
+        assert!(
+            !scripts[0].cst.source().is_empty(),
+            "parsed CST should retain its source"
         );
     }
 }
