@@ -9,8 +9,14 @@
 //! Subsystem groups render as nested `subgraph cluster_<id>` blocks so the
 //! hierarchy reads as boxes, with each non-group node placed inside its nearest
 //! group cluster.
+//!
+//! When a [`GraphModel`] carries a value/diff [`Overlay`], DOT degrades
+//! gracefully: each node's *at-time* cell (its `start_tick`, else its last tick)
+//! is looked up by node id, and a numeric value is appended to that node's label
+//! (e.g. `Speed\n50`). Non-numeric cells and nodes the overlay never touched are
+//! left untouched, so an un-overlaid model renders byte-identically to v1.
 
-use crate::model::{EdgeKind, GraphModel, GraphNode, NodeKind};
+use crate::model::{EdgeKind, GraphModel, GraphNode, NodeKind, Overlay, OverlayCell};
 use std::collections::{BTreeMap, HashMap};
 
 /// Render the model as a Graphviz DOT document.
@@ -20,6 +26,9 @@ use std::collections::{BTreeMap, HashMap};
 /// every non-group node is declared inside its *nearest* enclosing group
 /// cluster. Top-level groups and any node with no group ancestor are declared at
 /// the digraph root. Per-kind node/edge styling and `rankdir=LR` are preserved.
+///
+/// If `model.overlay` is set, each node's at-time numeric value is appended to
+/// its label (see the module docs); absent an overlay the output is unchanged.
 pub fn render(model: &GraphModel) -> String {
     let mut out = String::new();
     out.push_str("digraph m1 {\n");
@@ -58,12 +67,20 @@ pub fn render(model: &GraphModel) -> String {
     // top-level cluster recursively.
     if let Some(top_members) = members.get(&None) {
         for node in top_members {
-            out.push_str(&node_decl(node, 1));
+            out.push_str(&node_decl(node, 1, model.overlay.as_ref()));
         }
     }
     if let Some(roots) = children_groups.get(&None) {
         for group_id in roots {
-            emit_cluster(group_id, &by_id, &children_groups, &members, 1, &mut out);
+            emit_cluster(
+                group_id,
+                &by_id,
+                &children_groups,
+                &members,
+                1,
+                model.overlay.as_ref(),
+                &mut out,
+            );
         }
     }
 
@@ -125,6 +142,7 @@ fn emit_cluster<'a>(
     children_groups: &BTreeMap<Option<&'a str>, Vec<&'a str>>,
     members: &BTreeMap<Option<&'a str>, Vec<&'a GraphNode>>,
     depth: usize,
+    overlay: Option<&Overlay>,
     out: &mut String,
 ) {
     let indent = "  ".repeat(depth);
@@ -139,26 +157,42 @@ fn emit_cluster<'a>(
     // Direct non-group members of this cluster.
     if let Some(mems) = members.get(&Some(group_id)) {
         for node in mems {
-            out.push_str(&node_decl(node, depth + 1));
+            out.push_str(&node_decl(node, depth + 1, overlay));
         }
     }
     // Nested sub-clusters.
     if let Some(subs) = children_groups.get(&Some(group_id)) {
         for sub in subs {
-            emit_cluster(sub, by_id, children_groups, members, depth + 1, out);
+            emit_cluster(
+                sub,
+                by_id,
+                children_groups,
+                members,
+                depth + 1,
+                overlay,
+                out,
+            );
         }
     }
     out.push_str(&format!("{indent}}}\n"));
 }
 
 /// The DOT declaration line for a single non-group node at the given indent.
-fn node_decl(node: &GraphNode, depth: usize) -> String {
+///
+/// When `overlay` is `Some` and carries a numeric at-time cell for this node
+/// (see [`at_time_value`]), the value is appended to the label as a final
+/// `\n<value>` segment, so the static export reads the value alongside the
+/// structural metadata. Absent such a cell the label is exactly the v1 label.
+fn node_decl(node: &GraphNode, depth: usize, overlay: Option<&Overlay>) -> String {
     let (shape, color) = node_style(node.kind);
     let mut label = node.label().to_string();
     if let Some(rate) = node.rate_hz {
         label.push_str(&format!("\\n{rate} Hz"));
     } else if let Some(unit) = &node.unit {
         label.push_str(&format!("\\n[{unit}]"));
+    }
+    if let Some(value) = overlay.and_then(|o| at_time_value(o, &node.id)) {
+        label.push_str(&format!("\\n{value}"));
     }
     format!(
         "{}{} [label={}, shape={}, color={}];\n",
@@ -168,6 +202,25 @@ fn node_decl(node: &GraphNode, depth: usize) -> String {
         shape,
         color,
     )
+}
+
+/// The node's *at-time* numeric value from an [`Overlay`], or `None`.
+///
+/// The at-time tick is the overlay's [`Overlay::start_tick`] hint when set, else
+/// the node series' last tick (the design's "last-tick value"). Only a numeric
+/// ([`OverlayCell::Num`]) cell yields a value to append; boolean/string cells are
+/// label-only and nodes the overlay never touched return `None`. The number is
+/// formatted like Rust's default `f64` display (e.g. `50`, not `50.0`).
+fn at_time_value(overlay: &Overlay, node_id: &str) -> Option<f64> {
+    let series = &overlay.nodes.get(node_id)?.series;
+    let tick = overlay
+        .start_tick
+        .filter(|&i| i < series.len())
+        .unwrap_or(series.len().checked_sub(1)?);
+    match series.get(tick)? {
+        OverlayCell::Num(v) => Some(*v),
+        OverlayCell::Bool(_) | OverlayCell::Str(_) => None,
+    }
 }
 
 /// The parent path of a dotted id: everything before the final `.` segment, or
@@ -208,7 +261,8 @@ fn quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{GraphEdge, GraphNode};
+    use crate::model::{GraphEdge, GraphNode, NodeOverlay, Overlay, OverlayCell, OverlayKind};
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn sample() -> GraphModel {
         let mut g = GraphModel::new(Some("Demo".into()));
@@ -288,6 +342,142 @@ mod tests {
         assert!(
             !dot.contains("\"Root.Engine\" -> \"Root.Engine.Speed\""),
             "intra-cluster hierarchy edge should be suppressed:\n{dot}"
+        );
+    }
+
+    #[test]
+    fn dot_renders_without_overlay_unchanged() {
+        // DOT degrades gracefully: attaching an overlay must not perturb the
+        // structural output unless a node has an at-time numeric cell. With no
+        // overlay at all, the document is byte-identical to v1.
+        let g = sample();
+        assert!(g.overlay.is_none());
+        let bare = render(&g);
+        assert!(bare.starts_with("digraph m1 {"));
+        assert!(bare.trim_end().ends_with('}'));
+
+        // Attaching an overlay whose node ids do not match any graph node leaves
+        // the DOT byte-identical to the un-overlaid render (no spurious labels).
+        let mut nodes = BTreeMap::new();
+        nodes.insert(
+            "Root.Other.Thing".to_string(),
+            NodeOverlay {
+                series: vec![OverlayCell::Num(99.0)],
+                delta: None,
+                max_abs_delta: None,
+            },
+        );
+        let unmatched = Overlay {
+            kind: OverlayKind::Value,
+            time: vec![0.0],
+            nodes,
+            external: BTreeSet::new(),
+            changed: Vec::new(),
+            eps: None,
+            start_tick: None,
+        };
+        let overlaid = render(&sample().with_overlay(unmatched));
+        assert_eq!(
+            bare, overlaid,
+            "an overlay with no matching node must not change the DOT:\n{overlaid}"
+        );
+    }
+
+    #[test]
+    fn dot_appends_at_time_value_to_node_label() {
+        // When a node carries a numeric at-time cell, DOT appends it to the node
+        // label (e.g. `Speed\n50`) so the static export reads the value too. The
+        // at-time cell defaults to the last tick; `start_tick` overrides it.
+        let mut nodes = BTreeMap::new();
+        nodes.insert(
+            "Root.Engine.Speed".to_string(),
+            NodeOverlay {
+                series: vec![OverlayCell::Num(10.0), OverlayCell::Num(50.0)],
+                delta: None,
+                max_abs_delta: None,
+            },
+        );
+        let overlay = Overlay {
+            kind: OverlayKind::Value,
+            time: vec![0.0, 0.01],
+            nodes,
+            external: BTreeSet::new(),
+            changed: Vec::new(),
+            eps: None,
+            start_tick: None,
+        };
+        let dot = render(&sample().with_overlay(overlay));
+        let decl = dot
+            .lines()
+            .find(|l| l.contains("\"Root.Engine.Speed\" [label="))
+            .expect("Speed node should be declared");
+        // Last tick (50) is the default at-time value, appended after the unit.
+        // The label's newline separators are DOT-escaped (`\\n`) by `quote`.
+        assert!(
+            decl.contains("Speed\\\\n[rpm]\\\\n50"),
+            "expected the at-time value appended to the label:\n{decl}"
+        );
+    }
+
+    #[test]
+    fn dot_at_time_value_honours_start_tick() {
+        // `start_tick` selects which cell is the "at-time" value, not the last.
+        let mut nodes = BTreeMap::new();
+        nodes.insert(
+            "Root.Engine.Speed".to_string(),
+            NodeOverlay {
+                series: vec![OverlayCell::Num(10.0), OverlayCell::Num(50.0)],
+                delta: None,
+                max_abs_delta: None,
+            },
+        );
+        let overlay = Overlay {
+            kind: OverlayKind::Value,
+            time: vec![0.0, 0.01],
+            nodes,
+            external: BTreeSet::new(),
+            changed: Vec::new(),
+            eps: None,
+            start_tick: Some(0),
+        };
+        let dot = render(&sample().with_overlay(overlay));
+        let decl = dot
+            .lines()
+            .find(|l| l.contains("\"Root.Engine.Speed\" [label="))
+            .expect("Speed node should be declared");
+        assert!(
+            decl.contains("Speed\\\\n[rpm]\\\\n10"),
+            "start_tick=0 should select the first cell (10):\n{decl}"
+        );
+    }
+
+    #[test]
+    fn dot_does_not_append_non_numeric_cells() {
+        // A label-only cell (bool/str) carries no colour ramp and no numeric
+        // value to append, so the label is unchanged from the structural render.
+        let mut nodes = BTreeMap::new();
+        nodes.insert(
+            "Root.Engine.Speed".to_string(),
+            NodeOverlay {
+                series: vec![OverlayCell::Str("Idle".into())],
+                delta: None,
+                max_abs_delta: None,
+            },
+        );
+        let overlay = Overlay {
+            kind: OverlayKind::Value,
+            time: vec![0.0],
+            nodes,
+            external: BTreeSet::new(),
+            changed: Vec::new(),
+            eps: None,
+            start_tick: None,
+        };
+        let bare = render(&sample());
+        let overlaid = render(&sample().with_overlay(overlay));
+        assert_eq!(
+            bare, overlaid,
+            "a non-numeric at-time cell must not change the DOT:\n{overlaid}"
         );
     }
 

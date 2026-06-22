@@ -25,7 +25,10 @@ pub fn render_compact(model: &GraphModel) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{EdgeKind, GraphEdge, GraphNode, NodeKind};
+    use crate::model::{
+        EdgeKind, GraphEdge, GraphNode, NodeKind, NodeOverlay, Overlay, OverlayCell, OverlayKind,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
 
     #[test]
     fn renders_parseable_json_with_nodes_and_edges() {
@@ -49,5 +52,51 @@ mod tests {
     fn compact_has_no_newlines() {
         let g = GraphModel::new(None);
         assert!(!render_compact(&g).contains('\n'));
+    }
+
+    #[test]
+    fn overlay_is_present_in_json_when_attached() {
+        // The JSON export is the canonical machine-readable form and the HTML
+        // payload, so an attached overlay must ride in verbatim — `"overlay"`
+        // with the node series — while an un-overlaid model carries no such key
+        // (re-asserting O1's `skip_serializing_if` invariant at the renderer).
+        let mut g = GraphModel::new(Some("Demo".into()));
+        g.nodes
+            .push(GraphNode::new("Root.Demo.Output", NodeKind::Channel));
+
+        // Un-overlaid: no `"overlay"` key.
+        let bare = render(&g);
+        assert!(
+            !bare.contains("\"overlay\""),
+            "un-overlaid model leaked an `overlay` key:\n{bare}"
+        );
+
+        // Overlaid: `"overlay"` present, carrying the node series.
+        let mut nodes = BTreeMap::new();
+        nodes.insert(
+            "Root.Demo.Output".to_string(),
+            NodeOverlay {
+                series: vec![OverlayCell::Num(50.0)],
+                delta: None,
+                max_abs_delta: None,
+            },
+        );
+        let overlay = Overlay {
+            kind: OverlayKind::Value,
+            time: vec![0.0],
+            nodes,
+            external: BTreeSet::new(),
+            changed: Vec::new(),
+            eps: None,
+            start_tick: None,
+        };
+        let g = g.with_overlay(overlay);
+        let json = render(&g);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["overlay"]["kind"], "value");
+        assert_eq!(
+            parsed["overlay"]["nodes"]["Root.Demo.Output"]["series"][0]["num"],
+            50.0
+        );
     }
 }
