@@ -11,10 +11,13 @@
 //! HTML shell and the Cytoscape library are baked into the binary at compile
 //! time via [`include_str!`], so the tool ships them itself.
 //!
-//! The viewer ships a node search box and per-edge-kind filter toggles, both
-//! driven entirely by the embedded graph JSON in plain JS (no extra vendored
-//! asset). TODO(later): collapse/expand controls for compound (group) nodes and
-//! a dagre/elk layered layout (those layout extensions still need vendoring).
+//! The viewer ships a node search box, per-edge-kind filter toggles, a layered
+//! (breadthfirst, directed) default layout with selectable alternatives,
+//! collapse/expand of compound (group) subsystems, and click-to-highlight of a
+//! node's dependency cone (upstream + downstream) — all driven entirely by the
+//! embedded graph JSON in plain JS over core Cytoscape (no extra vendored
+//! asset). TODO(later): vendor the dagre/elk layout extensions the same way as
+//! the core library for production-grade edge routing.
 
 use crate::json;
 use crate::model::GraphModel;
@@ -22,6 +25,13 @@ use crate::model::GraphModel;
 /// The HTML shell, with `/*__CYTOSCAPE_JS__*/`, `/*__GRAPH_JSON__*/` and
 /// `__TITLE__` placeholders.
 const VIEWER_HTML: &str = include_str!("../templates/viewer.html");
+
+/// The graph-JSON placeholder *together with* the empty-graph fallback literal
+/// that follows it in the template. Replacing this whole token with the real
+/// JSON leaves a single valid object literal (`var GRAPH = {…};`); the template
+/// on its own stays valid JS because the comment is whitespace and `GRAPH`
+/// defaults to the empty fallback.
+const GRAPH_JSON_TOKEN: &str = "/*__GRAPH_JSON__*/{\"nodes\":[],\"edges\":[]}";
 
 /// The vendored Cytoscape.js library (MIT). Inlined so the output is offline and
 /// self-contained.
@@ -36,7 +46,7 @@ pub fn render(model: &GraphModel) -> String {
     // replacements introduce another placeholder.
     VIEWER_HTML
         .replace("/*__CYTOSCAPE_JS__*/", CYTOSCAPE_JS)
-        .replace("/*__GRAPH_JSON__*/", &graph_json)
+        .replace(GRAPH_JSON_TOKEN, &graph_json)
         .replace("__TITLE__", &html_escape_text(title))
 }
 
@@ -123,6 +133,108 @@ mod tests {
                 "expected checkbox inputs for the edge-kind filters"
             );
         }
+    }
+
+    #[test]
+    fn embedded_graph_assignment_is_valid_js() {
+        // Guard the GRAPH embedding: the renderer replaces the JSON placeholder
+        // in place, and the template's `|| {…}` fallback must keep the assignment
+        // a single valid expression. A regression here (two juxtaposed object
+        // literals) would make the *whole* viewer script a syntax error, so none
+        // of the interactive features would run despite string-presence tests.
+        let html = render(&sample());
+        // After substitution the GRAPH assignment is a *single* object literal:
+        // the placeholder+fallback token is gone, replaced by the real JSON.
+        // Line-anchored so an explanatory comment that mentions GRAPH cannot be
+        // mistaken for the assignment itself.
+        let assign = html
+            .split("\nvar GRAPH =")
+            .nth(1)
+            .expect("a GRAPH assignment");
+        let stmt = assign.split(';').next().expect("a terminated statement");
+        assert!(
+            stmt.contains("Root.Engine.Speed"),
+            "expected the embedded JSON in the GRAPH assignment"
+        );
+        // No leftover placeholder and no dangling empty-graph fallback that would
+        // turn the assignment into two juxtaposed object literals (a syntax error
+        // that would break the entire viewer script).
+        assert!(
+            !stmt.contains("/*__GRAPH_JSON__*/"),
+            "the graph placeholder must be consumed"
+        );
+        assert!(
+            !stmt.contains("\"nodes\":[],\"edges\":[]"),
+            "the empty-graph fallback must be consumed, not left dangling"
+        );
+        // Exactly one object literal: a single opening brace run, then a closing.
+        // The statement starts with whitespace + `{` (the JSON object).
+        assert!(
+            stmt.trim_start().starts_with('{'),
+            "GRAPH should be assigned a single object literal, got: {:.40}",
+            stmt.trim_start()
+        );
+    }
+
+    #[test]
+    fn viewer_has_collapse_and_cone_handlers() {
+        let html = render(&sample());
+        // A collapse/expand toggle control: a toolbar button the viewer wires to
+        // collapse compound (group) subsystems, plus a dblclick handler that does
+        // the same on a single compound node.
+        assert!(
+            html.contains("id=\"toggle-collapse\""),
+            "expected a collapse/expand toggle button with id=\"toggle-collapse\""
+        );
+        assert!(
+            html.contains("dblclick"),
+            "expected a dblclick handler so compound nodes collapse on double-click"
+        );
+        // Collapsed-state is tracked in a Set keyed by node id (authored name,
+        // distinct from anything in the minified library).
+        assert!(
+            html.contains("collapsedNodes"),
+            "expected a collapsedNodes set driving collapse/expand"
+        );
+        // The cone-highlight click handler: clicking a node highlights its
+        // dependency cone (upstream + downstream) and dims the rest.
+        assert!(
+            html.contains("highlightCone"),
+            "expected a highlightCone handler for click-to-highlight dependency cones"
+        );
+        // The BFS walks edges into the node (upstream — "what feeds this") and
+        // edges out of it (downstream), so both directions must be referenced.
+        assert!(
+            html.contains("incomers") && html.contains("outgoers"),
+            "expected the cone BFS to follow incomers (upstream) and outgoers (downstream)"
+        );
+        // Background-click clears the highlight.
+        assert!(
+            html.contains("clearCone"),
+            "expected a clearCone handler wired to background clicks"
+        );
+    }
+
+    #[test]
+    fn viewer_layout_is_layered() {
+        let html = render(&sample());
+        // The default layout is the layered DAG view that ships with core
+        // Cytoscape (breadthfirst, directed) — no second vendored asset. Anchor
+        // on the exact authored layout config so we are asserting the viewer's
+        // choice, not a `breadthfirst` substring that exists inside the minified
+        // library. `cose` stays selectable via the authored layout option list.
+        assert!(
+            html.contains("name: \"breadthfirst\""),
+            "expected the default layout config to name the layered `breadthfirst` layout"
+        );
+        assert!(
+            html.contains("LAYOUTS"),
+            "expected an authored LAYOUTS table offering selectable layouts"
+        );
+        assert!(
+            html.contains("\"cose\""),
+            "expected `cose` to remain a selectable layout option"
+        );
     }
 
     #[test]

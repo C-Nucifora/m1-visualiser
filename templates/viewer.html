@@ -18,6 +18,11 @@
     padding: 3px 8px; font-size: 13px; width: 180px;
   }
   #toolbar input#search::placeholder { color: #888; }
+  #toolbar select#layout, #toolbar button#toggle-collapse {
+    background: #2b2b33; color: #eee; border: 1px solid #444; border-radius: 3px;
+    padding: 3px 8px; font-size: 13px; cursor: pointer;
+  }
+  #toolbar button#toggle-collapse:hover { background: #3a3a44; }
   #toolbar .filters { display: flex; gap: 10px; font-size: 12px; }
   #toolbar .filters label { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
   #toolbar .filters label span::before {
@@ -33,6 +38,13 @@
   .e-table_axis::before { background: #8e44ad; }
   .e-hierarchy::before  { background: #e67e22; }
   .e-schedule::before   { background: #c0392b; }
+  #toolbar .help { font-size: 11px; color: #aaa; }
+  #toolbar .help .up::before, #toolbar .help .down::before {
+    content: ""; display: inline-block; width: 10px; height: 10px;
+    margin-right: 3px; vertical-align: middle; border-radius: 50%;
+  }
+  #toolbar .help .up::before   { background: #f1c40f; }
+  #toolbar .help .down::before { background: #1abc9c; }
   #cy { position: absolute; top: 40px; bottom: 0; left: 0; right: 0; }
 </style>
 <script>/*__CYTOSCAPE_JS__*/</script>
@@ -42,6 +54,15 @@
   <strong>__TITLE__</strong>
   <span id="counts"></span>
   <input id="search" type="search" placeholder="search nodes…" autocomplete="off" spellcheck="false" />
+  <select id="layout" title="layout">
+    <option value="breadthfirst">layered</option>
+    <option value="cose">force (cose)</option>
+    <option value="grid">grid</option>
+    <option value="circle">circle</option>
+    <option value="concentric">concentric</option>
+  </select>
+  <button id="toggle-collapse" type="button" title="collapse / expand every subsystem (double-click a subsystem to toggle just it)">collapse all</button>
+  <span class="help">click a node: <span class="up">feeds</span> / <span class="down">drives</span></span>
   <span class="filters">
     <label><input type="checkbox" id="filter-data_flow" checked /><span class="e-data_flow">data-flow</span></label>
     <label><input type="checkbox" id="filter-table_axis" checked /><span class="e-table_axis">table-axis</span></label>
@@ -57,8 +78,12 @@
 </div>
 <div id="cy"></div>
 <script>
-// The project's structural graph, embedded at generation time.
-var GRAPH = /*__GRAPH_JSON__*/ {"nodes":[],"edges":[]};
+// The project's structural graph, embedded at generation time. The renderer
+// replaces the JSON-placeholder comment together with the empty-graph fallback
+// literal that immediately follows it, leaving a single object literal assigned
+// to GRAPH. Unsubstituted, the comment is whitespace and GRAPH is the empty
+// fallback, so this template is itself always valid JS.
+var GRAPH = /*__GRAPH_JSON__*/{"nodes":[],"edges":[]};
 
 // Map a node to a fill colour by kind.
 var NODE_COLOR = {
@@ -67,6 +92,17 @@ var NODE_COLOR = {
 };
 var EDGE_COLOR = {
   data_flow: "#222", table_axis: "#8e44ad", hierarchy: "#e67e22", schedule: "#c0392b"
+};
+
+// Selectable layouts, all from core Cytoscape so the page stays offline. The
+// default is the layered (breadthfirst, directed) DAG read; the read->fn->write
+// data-flow orientation makes a top-down breadthfirst layout the natural view.
+var LAYOUTS = {
+  breadthfirst: { name: "breadthfirst", directed: true, animate: false, padding: 30, spacingFactor: 1.1 },
+  cose: { name: "cose", animate: false, padding: 30 },
+  grid: { name: "grid", animate: false, padding: 30 },
+  circle: { name: "circle", animate: false, padding: 30 },
+  concentric: { name: "concentric", animate: false, padding: 30 }
 };
 
 function toElements(graph) {
@@ -145,12 +181,57 @@ document.addEventListener("DOMContentLoaded", function () {
         // Edge kind toggled off: hide it entirely.
         selector: "edge.filtered-out",
         style: { "display": "none" }
+      },
+      {
+        // Collapsed compound: its descendants are hidden by the collapse logic;
+        // mark the compound itself so it reads as a folded subsystem.
+        selector: "node.collapsed",
+        style: {
+          "background-opacity": 0.35, "border-width": 2, "border-style": "double",
+          "text-valign": "center", "color": "#fff"
+        }
+      },
+      {
+        // Hidden by collapse (a descendant of a collapsed compound).
+        selector: ".hidden-collapse",
+        style: { "display": "none" }
+      },
+      {
+        // Cone highlight: upstream arm ("what feeds this") in amber.
+        selector: ".cone-up",
+        style: {
+          "background-color": "#f1c40f", "line-color": "#f1c40f",
+          "target-arrow-color": "#f1c40f", "color": "#000", "z-index": 20
+        }
+      },
+      {
+        // Cone highlight: downstream arm ("what this drives") in teal.
+        selector: ".cone-down",
+        style: {
+          "background-color": "#1abc9c", "line-color": "#1abc9c",
+          "target-arrow-color": "#1abc9c", "color": "#000", "z-index": 20
+        }
+      },
+      {
+        // The focused node sits at the apex of both cones.
+        selector: "node.cone-focus",
+        style: {
+          "border-width": 3, "border-color": "#fff", "z-index": 30
+        }
+      },
+      {
+        // Everything outside the cone is dimmed while a cone is active.
+        selector: ".cone-dimmed",
+        style: { "opacity": 0.08, "text-opacity": 0.08 }
       }
     ],
-    // TODO(later): use the dagre/elk layout extensions for a layered DAG view
-    // once they are vendored; "cose" ships with core Cytoscape and needs no
-    // extra asset, so the scaffold defaults to it.
-    layout: { name: "cose", animate: false, padding: 30 }
+    // The default layout is a layered (breadthfirst, directed) DAG read that
+    // ships with core Cytoscape — no second vendored asset. The read->fn->write
+    // edge orientation makes this the natural left-to-right data-flow view.
+    // TODO(later): vendor the dagre/elk extensions the same way as the core lib
+    // for production-grade edge routing; until then `LAYOUTS` only offers core
+    // layouts so the page stays fully offline.
+    layout: LAYOUTS.breadthfirst
   });
 
   // --- Search: dim nodes whose label/id does not contain the query ---------
@@ -187,6 +268,146 @@ document.addEventListener("DOMContentLoaded", function () {
       box.addEventListener("change", function () { applyFilter(kind); });
       applyFilter(kind);
     }
+  });
+
+  // --- Layout selector: re-run a core Cytoscape layout on demand -------------
+  var layoutSelect = document.getElementById("layout");
+  function applyLayout(name) {
+    var cfg = LAYOUTS[name] || LAYOUTS.breadthfirst;
+    cy.layout(cfg).run();
+  }
+  if (layoutSelect) {
+    layoutSelect.addEventListener("change", function () {
+      applyLayout(layoutSelect.value);
+    });
+  }
+
+  // --- Collapse / expand of compound subsystems ------------------------------
+  // Plain JS over node.descendants(); collapsed state is a Set of compound ids.
+  // Collapsing a subsystem hides its descendants (nodes and their incident
+  // edges) and marks the compound itself; expanding restores them. We never
+  // touch a descendant that is itself inside another *still-collapsed* compound,
+  // so nested subsystems stay folded when an ancestor is re-expanded.
+  var collapsedNodes = new Set();
+
+  function isUnderCollapsedDescendant(node, openingId) {
+    // True if `node` lies inside some collapsed compound other than the one we
+    // are currently expanding — used to keep nested folds intact.
+    var anc = node.ancestors();
+    for (var i = 0; i < anc.length; i++) {
+      var aid = anc[i].id();
+      if (aid !== openingId && collapsedNodes.has(aid)) { return true; }
+    }
+    return false;
+  }
+
+  function collapseNode(node) {
+    if (!node.isParent() || collapsedNodes.has(node.id())) { return; }
+    collapsedNodes.add(node.id());
+    node.addClass("collapsed");
+    node.descendants().forEach(function (d) {
+      d.addClass("hidden-collapse");
+      d.connectedEdges().addClass("hidden-collapse");
+    });
+  }
+
+  function expandNode(node) {
+    if (!collapsedNodes.has(node.id())) { return; }
+    collapsedNodes.delete(node.id());
+    node.removeClass("collapsed");
+    node.descendants().forEach(function (d) {
+      if (isUnderCollapsedDescendant(d, node.id())) { return; }
+      d.removeClass("hidden-collapse");
+      // Re-show an edge only when neither endpoint is still hidden.
+      d.connectedEdges().forEach(function (e) {
+        if (!e.source().hasClass("hidden-collapse") &&
+            !e.target().hasClass("hidden-collapse")) {
+          e.removeClass("hidden-collapse");
+        }
+      });
+    });
+  }
+
+  function toggleNode(node) {
+    if (collapsedNodes.has(node.id())) { expandNode(node); } else { collapseNode(node); }
+  }
+
+  // Double-click a compound node to fold/unfold just that subsystem.
+  cy.on("dblclick", "node", function (evt) {
+    var n = evt.target;
+    if (n.isParent()) { toggleNode(n); }
+  });
+
+  // Toolbar button: collapse every subsystem, or expand them all if any are
+  // already collapsed (acts as a global toggle).
+  var collapseBtn = document.getElementById("toggle-collapse");
+  function refreshCollapseBtn() {
+    if (!collapseBtn) { return; }
+    collapseBtn.textContent = collapsedNodes.size > 0 ? "expand all" : "collapse all";
+  }
+  if (collapseBtn) {
+    collapseBtn.addEventListener("click", function () {
+      if (collapsedNodes.size > 0) {
+        cy.nodes(":parent").forEach(function (n) { expandNode(n); });
+      } else {
+        cy.nodes(":parent").forEach(function (n) { collapseNode(n); });
+      }
+      refreshCollapseBtn();
+    });
+  }
+  // Keep the button label in sync after a dblclick toggle too.
+  cy.on("dblclick", "node", function () { refreshCollapseBtn(); });
+
+  // --- Dependency cone highlight ---------------------------------------------
+  // Click a node to highlight its dependency cone: BFS upstream over edges that
+  // point *into* the node (its incomers — "what feeds this") and downstream over
+  // edges that point *out* of it (its outgoers — "what this drives"), then dim
+  // everything outside the cone. The M3 read->fn->write orientation makes the
+  // upstream arm a pure reverse-reachability walk. Background click clears it.
+  function walkCone(start, direction) {
+    // Iterative BFS collecting nodes and the edges traversed. `direction` is
+    // "in" (follow incomers) or "out" (follow outgoers).
+    var seenNodes = cy.collection();
+    var seenEdges = cy.collection();
+    var frontier = [start];
+    var visited = {};
+    visited[start.id()] = true;
+    while (frontier.length > 0) {
+      var node = frontier.shift();
+      var edges = direction === "in" ? node.incomers("edge") : node.outgoers("edge");
+      edges.forEach(function (e) {
+        seenEdges = seenEdges.union(e);
+        var next = direction === "in" ? e.source() : e.target();
+        seenNodes = seenNodes.union(next);
+        if (!visited[next.id()]) {
+          visited[next.id()] = true;
+          frontier.push(next);
+        }
+      });
+    }
+    return seenNodes.union(seenEdges);
+  }
+
+  function clearCone() {
+    cy.elements().removeClass("cone-up cone-down cone-focus cone-dimmed");
+  }
+
+  function highlightCone(node) {
+    clearCone();
+    var upstream = walkCone(node, "in");
+    var downstream = walkCone(node, "out");
+    var cone = node.union(upstream).union(downstream);
+    // Dim everything not in the cone, then paint the two arms over the top.
+    cy.elements().not(cone).addClass("cone-dimmed");
+    upstream.addClass("cone-up");
+    downstream.addClass("cone-down");
+    node.addClass("cone-focus");
+  }
+
+  cy.on("tap", "node", function (evt) { highlightCone(evt.target); });
+  cy.on("tap", function (evt) {
+    // Background tap (the click target is the core, not an element) clears.
+    if (evt.target === cy) { clearCone(); }
   });
 });
 </script>

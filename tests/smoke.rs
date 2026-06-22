@@ -98,3 +98,61 @@ fn html_render_is_self_contained() {
     );
     assert!(page.contains("Root.Engine.Speed"), "graph data embedded");
 }
+
+#[test]
+fn viewer_runs_cone_over_real_dataflow() {
+    // Structural check (no DOM): the rendered page must embed the Limiter
+    // data-flow edges so the in-browser cone walk has real data to traverse.
+    // The fixture's Limiter reads Speed + MaxSpeed.Value and writes Limited,
+    // giving a cone with both an upstream and a downstream arm.
+    let model = loader::load(&fixture_project(), None, Some("Synthetic".into()))
+        .expect("fixture project should load");
+
+    // Sanity: the model itself has the oriented data-flow edges (reads in,
+    // writes out) the cone walk relies on.
+    assert!(
+        model.edges.iter().any(|e| e.kind == EdgeKind::DataFlow
+            && e.from == "Root.Engine.Speed"
+            && e.to == "Root.Engine.Limiter"),
+        "expected upstream read edge Speed -> Limiter; edges = {:?}",
+        model.edges
+    );
+    assert!(
+        model.edges.iter().any(|e| e.kind == EdgeKind::DataFlow
+            && e.from == "Root.Engine.Limiter"
+            && e.to == "Root.Engine.Limited"),
+        "expected downstream write edge Limiter -> Limited; edges = {:?}",
+        model.edges
+    );
+
+    let page = html::render(&model);
+
+    // The cone-highlight machinery is present and self-contained (offline).
+    assert!(
+        page.contains("highlightCone"),
+        "viewer should ship the cone-highlight handler"
+    );
+    assert!(
+        page.contains("incomers") && page.contains("outgoers"),
+        "cone BFS should walk both upstream and downstream"
+    );
+
+    // The embedded JSON carries the Limiter data-flow edges so the BFS can run.
+    assert!(
+        page.contains("\"Root.Engine.Limiter\""),
+        "embedded graph should name the Limiter function node"
+    );
+    assert!(
+        page.contains("\"data_flow\""),
+        "embedded graph should carry data-flow edges for the cone walk"
+    );
+    // Both arms of the cone are present in the embedded edge list.
+    assert!(
+        page.contains("\"Root.Engine.Speed\""),
+        "embedded graph should carry the upstream read endpoint"
+    );
+    assert!(
+        page.contains("\"Root.Engine.Limited\""),
+        "embedded graph should carry the downstream write endpoint"
+    );
+}
