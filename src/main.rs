@@ -18,6 +18,11 @@ struct Args {
     /// Project.m1prj (defaults to nearest upward, or $M1_PROJECT).
     #[arg(long)]
     project: Option<PathBuf>,
+    /// Parameters `.m1cfg` (table/parameter shape; drives table dimensions).
+    /// When omitted, a single sibling `*.m1cfg` next to the project is used;
+    /// ambiguity (zero or several) means none.
+    #[arg(long)]
+    config: Option<PathBuf>,
     /// Output file. Defaults to `m1-graph.<ext>` for the chosen format.
     #[arg(long)]
     out: Option<PathBuf>,
@@ -68,6 +73,28 @@ fn resolve_project(arg: Option<PathBuf>) -> Option<PathBuf> {
     }
 }
 
+/// Resolve the config path: explicit `--config` wins. Otherwise discover a
+/// single sibling `*.m1cfg` next to the project; if zero or several exist the
+/// result is `None` (conservative — ambiguity never guesses).
+fn resolve_config(arg: Option<PathBuf>, project_path: &std::path::Path) -> Option<PathBuf> {
+    if let Some(p) = arg {
+        return Some(p);
+    }
+    let dir = project_path.parent()?;
+    let mut found: Option<PathBuf> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("m1cfg") {
+            if found.is_some() {
+                // More than one sibling cfg: ambiguous, so use none.
+                return None;
+            }
+            found = Some(path);
+        }
+    }
+    found
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -76,6 +103,8 @@ fn main() {
         process::exit(2);
     };
 
+    let config_path = resolve_config(args.config, &project_path);
+
     let title = args.title.or_else(|| {
         project_path
             .parent()
@@ -83,7 +112,7 @@ fn main() {
             .map(|n| n.to_string_lossy().into_owned())
     });
 
-    let model = match loader::load(&project_path, None, title) {
+    let model = match loader::load(&project_path, config_path.as_deref(), title) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("m1-visualiser: {}: {e}", project_path.display());
