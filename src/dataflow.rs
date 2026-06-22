@@ -34,7 +34,7 @@
 //!
 //! Only *project symbols* land in the sets — function-locals, builtin library
 //! objects, and the `In`/`Out`/`This` anchors are excluded. Names are
-//! canonicalised through [`classify`] (and a leading `This` is rewritten to the
+//! canonicalised through `classify` (and a leading `This` is rewritten to the
 //! enclosing group first), so `Speed`, `This.Speed`, and `Root.Demo.Speed` all
 //! collapse to one path.
 //!
@@ -363,7 +363,10 @@ mod tests {
         assert!(sets.reads.contains("Root.Demo.Gain"), "{sets:?}");
         // `scaled` must not appear as a channel.
         assert!(!sets.reads.iter().any(|r| r.contains("scaled")), "{sets:?}");
-        assert!(!sets.writes.iter().any(|w| w.contains("scaled")), "{sets:?}");
+        assert!(
+            !sets.writes.iter().any(|w| w.contains("scaled")),
+            "{sets:?}"
+        );
     }
 
     #[test]

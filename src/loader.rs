@@ -24,7 +24,7 @@
 //!
 //! - **DataFlow edges** from per-script read/write analysis ([`crate::dataflow`]):
 //!   each script's reads point into its backing function, its writes point out —
-//!   see [`add_data_flow_edges`].
+//!   see `add_data_flow_edges`.
 
 use crate::model::{EdgeKind, GraphEdge, GraphModel, GraphNode, NodeKind};
 use m1_typecheck::Project;
@@ -145,7 +145,11 @@ fn collect_scripts_rec(dir: &Path, out: &mut Vec<(String, String)>) {
         if path.is_dir() {
             collect_scripts_rec(&path, out);
         } else if path.extension().and_then(|e| e.to_str()) == Some("m1scr") {
-            let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+            let Some(name) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_string)
+            else {
                 continue;
             };
             let bytes = std::fs::read(&path).unwrap_or_default();
@@ -363,12 +367,20 @@ fn add_data_flow_edges(project: &Project, scripts: &[ParsedScript], model: &mut 
         // must be real graph nodes (guards builtins / external channels).
         for read in &sets.reads {
             if node_ids.contains(read) {
-                edges.push(GraphEdge::new(read.clone(), func.clone(), EdgeKind::DataFlow));
+                edges.push(GraphEdge::new(
+                    read.clone(),
+                    func.clone(),
+                    EdgeKind::DataFlow,
+                ));
             }
         }
         for write in &sets.writes {
             if node_ids.contains(write) {
-                edges.push(GraphEdge::new(func.clone(), write.clone(), EdgeKind::DataFlow));
+                edges.push(GraphEdge::new(
+                    func.clone(),
+                    write.clone(),
+                    EdgeKind::DataFlow,
+                ));
             }
         }
     }
@@ -764,7 +776,11 @@ mod tests {
         std::fs::write(&scr, "Output = 1;\n").expect("write script");
 
         let pairs = collect_scripts(dir.path());
-        assert_eq!(pairs.len(), 1, "exactly one .m1scr discovered; got {pairs:?}");
+        assert_eq!(
+            pairs.len(),
+            1,
+            "exactly one .m1scr discovered; got {pairs:?}"
+        );
         assert_eq!(pairs[0].0, "Update.m1scr", "discovered by basename");
         assert!(!pairs[0].1.is_empty(), "source should be non-empty");
 
@@ -824,11 +840,7 @@ mod tests {
         );
 
         // The synthetic clock node exists exactly once, with a stable id.
-        let clock_count = model
-            .nodes
-            .iter()
-            .filter(|n| n.id == "Clock@100Hz")
-            .count();
+        let clock_count = model.nodes.iter().filter(|n| n.id == "Clock@100Hz").count();
         assert_eq!(
             clock_count, 1,
             "exactly one Clock@100Hz node; nodes = {:?}",
@@ -895,11 +907,7 @@ mod tests {
         let project = Project::from_xml(SCHEDULE_PROJECT).unwrap();
         let model = build_model(&project, None);
 
-        let clock_count = model
-            .nodes
-            .iter()
-            .filter(|n| n.id == "Clock@100Hz")
-            .count();
+        let clock_count = model.nodes.iter().filter(|n| n.id == "Clock@100Hz").count();
         assert_eq!(
             clock_count, 1,
             "two 100 Hz nodes share ONE Clock@100Hz node; nodes = {:?}",
@@ -907,9 +915,10 @@ mod tests {
         );
 
         let from_100hz = |to: &str| {
-            model.edges.iter().any(|e| {
-                e.from == "Clock@100Hz" && e.to == to && e.kind == EdgeKind::Schedule
-            })
+            model
+                .edges
+                .iter()
+                .any(|e| e.from == "Clock@100Hz" && e.to == to && e.kind == EdgeKind::Schedule)
         };
         assert!(
             from_100hz("Root.Engine.Ctrl"),

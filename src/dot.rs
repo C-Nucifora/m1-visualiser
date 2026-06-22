@@ -2,7 +2,7 @@
 //! Graphviz DOT export of a [`GraphModel`].
 //!
 //! Produces a `digraph` with one node per [`GraphNode`] and one edge per
-//! [`GraphEdge`]. Node shape/colour is keyed off [`NodeKind`] and edge style off
+//! `GraphEdge`. Node shape/colour is keyed off [`NodeKind`] and edge style off
 //! [`EdgeKind`] so the four relationship types read distinctly. Render with e.g.
 //! `dot -Tsvg graph.dot -o graph.svg`.
 //!
@@ -33,8 +33,7 @@ pub fn render(model: &GraphModel) -> String {
 
     // Index every node by id, and bucket each node under the nearest group
     // ancestor that exists in the model (or `None` for the digraph root).
-    let by_id: HashMap<&str, &GraphNode> =
-        model.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let by_id: HashMap<&str, &GraphNode> = model.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
     let cluster_of: HashMap<&str, Option<&str>> = model
         .nodes
         .iter()
@@ -129,10 +128,7 @@ fn emit_cluster<'a>(
     out: &mut String,
 ) {
     let indent = "  ".repeat(depth);
-    let label = by_id
-        .get(group_id)
-        .map(|n| n.label())
-        .unwrap_or(group_id);
+    let label = by_id.get(group_id).map(|n| n.label()).unwrap_or(group_id);
     out.push_str(&format!(
         "{indent}subgraph {} {{\n",
         quote(&format!("cluster_{group_id}"))

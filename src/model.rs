@@ -42,7 +42,7 @@ impl NodeKind {
     }
 }
 
-/// The kind of relationship a [`GraphEdge`] represents. The four structural
+/// The kind of relationship a `GraphEdge` represents. The four structural
 /// relationship types the visualiser models (see the design doc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
