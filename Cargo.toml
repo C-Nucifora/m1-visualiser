@@ -7,6 +7,13 @@ description = "Interactive structural graph/visualiser for MoTeC M1 projects"
 license = "GPL-3.0-or-later"
 publish = false
 
+[features]
+# Opt-in support for binary `.ld` overlay logs (`--overlay-log run.ld`), wired
+# straight through to `m1-eval`'s `ld` feature. Off by default: without it a
+# `.ld` log fails loud through the engine, naming the feature, while `.csv`
+# logs always work.
+ld = ["m1-eval/ld"]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
