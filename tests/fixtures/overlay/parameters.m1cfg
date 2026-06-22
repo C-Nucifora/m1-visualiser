@@ -1,0 +1,8 @@
+<?xml version="1.0"?>
+<Configuration Locale="English_Australia.1252" DefaultLocale="C">
+ <Group Name="">
+  <Parameter Name="Demo.Gain">
+   <Cell Type="f32"><![CDATA[2.5]]></Cell>
+  </Parameter>
+ </Group>
+</Configuration>
