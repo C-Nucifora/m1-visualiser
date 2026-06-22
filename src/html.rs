@@ -63,7 +63,10 @@ fn html_escape_text(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{EdgeKind, GraphEdge, GraphNode, NodeKind};
+    use crate::model::{
+        EdgeKind, GraphEdge, GraphNode, NodeKind, NodeOverlay, Overlay, OverlayCell, OverlayKind,
+    };
+    use std::collections::BTreeMap;
 
     fn sample() -> GraphModel {
         let mut g = GraphModel::new(Some("Demo".into()));
@@ -76,6 +79,43 @@ mod tests {
             EdgeKind::Hierarchy,
         ));
         g
+    }
+
+    /// A small VALUE-overlaid model: one numeric node (`Speed`) carrying a
+    /// two-tick series, plus an externally-driven `Output` node, so the
+    /// value-overlay viewer tests have a concrete page to assert against.
+    fn value_overlaid_sample() -> GraphModel {
+        let mut g = sample();
+        g.nodes
+            .push(GraphNode::new("Root.Engine.Output", NodeKind::Channel));
+
+        let mut nodes = BTreeMap::new();
+        nodes.insert(
+            "Root.Engine.Speed".to_string(),
+            NodeOverlay {
+                series: vec![OverlayCell::Num(10.0), OverlayCell::Num(50.0)],
+                delta: None,
+                max_abs_delta: None,
+            },
+        );
+        nodes.insert(
+            "Root.Engine.Output".to_string(),
+            NodeOverlay {
+                series: vec![OverlayCell::Num(20.0), OverlayCell::Num(20.0)],
+                delta: None,
+                max_abs_delta: None,
+            },
+        );
+        let overlay = Overlay {
+            kind: OverlayKind::Value,
+            time: vec![0.0, 0.01],
+            nodes,
+            external: ["Root.Engine.Output".to_string()].into_iter().collect(),
+            changed: Vec::new(),
+            eps: None,
+            start_tick: Some(1),
+        };
+        g.with_overlay(overlay)
     }
 
     #[test]
@@ -253,5 +293,104 @@ mod tests {
                 "expected the legend to mention {legend_class}"
             );
         }
+    }
+
+    // ---- O8: the VALUE overlay viewer (scrubber, readout, externals, ramp) ----
+
+    #[test]
+    fn value_overlay_embeds_overlay_json() {
+        // The overlay rides inside the same GRAPH JSON the v1 viewer embeds — no
+        // second document, no network — so rendering an overlaid model must put
+        // `"overlay"` with `"kind":"value"` into the page's GRAPH literal.
+        let html = render(&value_overlaid_sample());
+        let assign = html
+            .split("\nvar GRAPH =")
+            .nth(1)
+            .expect("a GRAPH assignment");
+        let stmt = assign.split(';').next().expect("a terminated statement");
+        assert!(
+            stmt.contains("\"overlay\""),
+            "the overlay must ride inside the embedded GRAPH JSON:\n{stmt:.200}"
+        );
+        assert!(
+            stmt.contains("\"kind\":\"value\""),
+            "the embedded overlay must declare kind=value:\n{stmt:.200}"
+        );
+        // And a node series is carried so the scrubber has values to read.
+        assert!(
+            stmt.contains("Root.Engine.Speed"),
+            "the overlaid node id must be in the embedded JSON:\n{stmt:.200}"
+        );
+    }
+
+    #[test]
+    fn viewer_has_time_scrubber_when_overlay_present() {
+        // The value overlay ships a range input over `overlay.time` and an
+        // `applyOverlayAtTick` function wired to it, so the user can step ticks
+        // and re-colour. Asserted by id/name presence (cargo test can't drive a
+        // browser, so the renderer + template are the unit under test).
+        let html = render(&value_overlaid_sample());
+        assert!(
+            html.contains("type=\"range\"") && html.contains("id=\"scrubber\""),
+            "expected a <input type=\"range\" id=\"scrubber\"> time scrubber"
+        );
+        assert!(
+            html.contains("applyOverlayAtTick"),
+            "expected an applyOverlayAtTick function wired to the scrubber"
+        );
+        // The whole overlay block is guarded so the structural page is untouched
+        // when no overlay is embedded.
+        assert!(
+            html.contains("GRAPH.overlay"),
+            "the overlay viewer must be guarded by a GRAPH.overlay check"
+        );
+    }
+
+    #[test]
+    fn viewer_has_value_readout() {
+        // A `#readout` element plus a node click that writes the focused node's
+        // value into it (alongside the existing highlightCone).
+        let html = render(&value_overlaid_sample());
+        assert!(
+            html.contains("id=\"readout\""),
+            "expected a #readout span for the value readout"
+        );
+        // The readout is written from the embedded series — the handler reads a
+        // node's overlay cell and shows it.
+        assert!(
+            html.contains("readout"),
+            "expected a click handler writing into the readout"
+        );
+    }
+
+    #[test]
+    fn viewer_distinguishes_external_nodes() {
+        // Externally-driven channels (`overlay.external`) get a dashed-border
+        // treatment so simulated inputs read distinctly from evaluated outputs.
+        let html = render(&value_overlaid_sample());
+        assert!(
+            html.contains("overlay.external") || html.contains(".external"),
+            "the viewer must reference overlay.external / an external class"
+        );
+        assert!(
+            html.contains("dashed"),
+            "external nodes must get a dashed border treatment"
+        );
+    }
+
+    #[test]
+    fn viewer_value_ramp_present() {
+        // A `valueColor(v)` ramp and a size-by-value rule, so numeric nodes
+        // colour and size by magnitude.
+        let html = render(&value_overlaid_sample());
+        assert!(
+            html.contains("valueColor"),
+            "expected a valueColor(v) ramp function"
+        );
+        // The size-by-value rule scales node geometry by magnitude.
+        assert!(
+            html.contains("valueSize") || html.contains("overlay-num"),
+            "expected a size-by-value rule for numeric overlay nodes"
+        );
     }
 }

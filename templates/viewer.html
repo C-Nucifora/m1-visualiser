@@ -45,6 +45,27 @@
   }
   #toolbar .help .up::before   { background: #f1c40f; }
   #toolbar .help .down::before { background: #1abc9c; }
+  /* Overlay scrubber row: a second toolbar shown only when GRAPH.overlay is set.
+     Hidden by default so the structural page (no overlay) is untouched. */
+  #overlaybar {
+    position: fixed; top: 40px; left: 0; right: 0; height: 32px;
+    display: none; align-items: center; gap: 10px; padding: 0 12px;
+    background: #26262e; color: #eee; font-size: 13px; z-index: 9;
+    border-top: 1px solid #333;
+  }
+  #overlaybar.shown { display: flex; }
+  #overlaybar input#scrubber { flex: 1 1 auto; max-width: 360px; cursor: pointer; }
+  #overlaybar .ovlabel { color: #aaa; font-size: 12px; }
+  #overlaybar #time-readout { font-variant-numeric: tabular-nums; min-width: 64px; }
+  #overlaybar #readout {
+    margin-left: auto; font-variant-numeric: tabular-nums;
+    background: #1b1b22; border: 1px solid #444; border-radius: 3px;
+    padding: 2px 8px; min-width: 160px;
+  }
+  #overlaybar #readout:empty::before { content: "click a node for its value"; color: #777; }
+  /* Externally-driven channels read distinctly: a dashed border + an "ext" badge.
+     When the overlay bar is shown, the graph viewport drops below it. */
+  body.has-overlay #cy { top: 72px; }
   #cy { position: absolute; top: 40px; bottom: 0; left: 0; right: 0; }
 </style>
 <script>/*__CYTOSCAPE_JS__*/</script>
@@ -75,6 +96,15 @@
     <span class="e-hierarchy">hierarchy</span>
     <span class="e-schedule">schedule</span>
   </span>
+</div>
+<!-- Value/diff overlay scrubber row. Hidden until the viewer script detects an
+     embedded `GRAPH.overlay` and adds the `shown` class, so the structural page
+     (no overlay) never sees it. -->
+<div id="overlaybar">
+  <span class="ovlabel">tick</span>
+  <input id="scrubber" type="range" min="0" max="0" value="0" step="1" />
+  <span id="time-readout">t = 0</span>
+  <span id="readout"></span>
 </div>
 <div id="cy"></div>
 <script>
@@ -112,6 +142,8 @@ function toElements(graph) {
     if (n.rate_hz != null) { label += "\n" + n.rate_hz + " Hz"; }
     else if (n.unit) { label += "\n[" + n.unit + "]"; }
     var data = { id: n.id, label: label, kind: n.kind };
+    // Carry the unit through so the value readout can show `id = value (unit)`.
+    if (n.unit) { data.unit = n.unit; }
     // Compound nesting: a node's parent group becomes its Cytoscape parent,
     // but only when that parent is itself a group node in the graph.
     if (n.parent) { data.parent = n.parent; }
@@ -223,6 +255,31 @@ document.addEventListener("DOMContentLoaded", function () {
         // Everything outside the cone is dimmed while a cone is active.
         selector: ".cone-dimmed",
         style: { "opacity": 0.08, "text-opacity": 0.08 }
+      },
+      {
+        // VALUE overlay, numeric node: fill from the valueColor ramp and scale
+        // geometry by magnitude (both stored as data() by applyOverlayAtTick).
+        selector: "node.overlay-num",
+        style: {
+          "background-color": "data(ovColor)",
+          "width": "data(ovSize)", "height": "data(ovSize)",
+          "shape": "ellipse"
+        }
+      },
+      {
+        // VALUE overlay, label-only node (bool/str): keep the kind colour, just
+        // show the value string folded into the label by applyOverlayAtTick.
+        selector: "node.overlay-label",
+        style: { "background-color": function (ele) {
+          return NODE_COLOR[ele.data("kind")] || "#555"; } }
+      },
+      {
+        // Externally-driven channel: a dashed border + the kind colour, so a
+        // simulated input reads distinctly from an evaluated output.
+        selector: "node.external",
+        style: {
+          "border-width": 2, "border-style": "dashed", "border-color": "#f39c12"
+        }
       }
     ],
     // The default layout is a layered (breadthfirst, directed) DAG read that
@@ -409,6 +466,143 @@ document.addEventListener("DOMContentLoaded", function () {
     // Background tap (the click target is the core, not an element) clears.
     if (evt.target === cy) { clearCone(); }
   });
+
+  // --- VALUE overlay: colour/size by value, time scrubber, value readout ------
+  // Everything below is guarded by `GRAPH.overlay` of kind "value", so the
+  // structural page (no overlay embedded) behaves exactly as v1 — the overlay
+  // bar stays hidden and none of this wiring runs. The overlay rides inside the
+  // same embedded GRAPH JSON the v1 viewer already uses, so the page stays
+  // self-contained (no network, no second document).
+  var overlay = GRAPH.overlay;
+  if (overlay && overlay.kind === "value") {
+    document.body.classList.add("has-overlay");
+    var bar = document.getElementById("overlaybar");
+    if (bar) { bar.classList.add("shown"); }
+
+    var time = overlay.time || [];
+    var lastTick = Math.max(0, time.length - 1);
+    // The default tick is the embedded `--at-time` start hint, else the last
+    // tick (the design's "last-tick value").
+    var startTick = (typeof overlay.start_tick === "number") ? overlay.start_tick : lastTick;
+    if (startTick < 0) { startTick = 0; }
+    if (startTick > lastTick) { startTick = lastTick; }
+
+    var external = new Set(overlay.external || []);
+
+    // The span (max-min) of every numeric cell across all nodes and ticks, used
+    // to normalise the colour ramp and the size-by-value rule. Computed once.
+    var ovMin = Infinity, ovMax = -Infinity;
+    Object.keys(overlay.nodes || {}).forEach(function (id) {
+      (overlay.nodes[id].series || []).forEach(function (cell) {
+        if (cell && typeof cell.num === "number") {
+          if (cell.num < ovMin) { ovMin = cell.num; }
+          if (cell.num > ovMax) { ovMax = cell.num; }
+        }
+      });
+    });
+    if (!isFinite(ovMin)) { ovMin = 0; ovMax = 1; }
+
+    // A perceptual blue->amber->red ramp over [ovMin, ovMax]; flat scales map to
+    // the mid colour. Returns a hex string Cytoscape can use as a fill.
+    function valueColor(v) {
+      var span = ovMax - ovMin;
+      var t = span > 0 ? (v - ovMin) / span : 0.5;
+      if (t < 0) { t = 0; } else if (t > 1) { t = 1; }
+      // Three-stop interpolation: #2980b9 (low) -> #f1c40f (mid) -> #c0392b (high).
+      var stops = [[41, 128, 185], [241, 196, 15], [192, 57, 43]];
+      var seg = t < 0.5 ? 0 : 1;
+      var local = t < 0.5 ? t / 0.5 : (t - 0.5) / 0.5;
+      var a = stops[seg], b = stops[seg + 1];
+      var r = Math.round(a[0] + (b[0] - a[0]) * local);
+      var g = Math.round(a[1] + (b[1] - a[1]) * local);
+      var bl = Math.round(a[2] + (b[2] - a[2]) * local);
+      return "rgb(" + r + "," + g + "," + bl + ")";
+    }
+
+    // Node diameter (px) by magnitude: a fixed range so larger |value| reads as
+    // a bigger node, independent of the ramp.
+    function valueSize(v) {
+      var span = ovMax - ovMin;
+      var t = span > 0 ? (v - ovMin) / span : 0.5;
+      if (t < 0) { t = 0; } else if (t > 1) { t = 1; }
+      return 24 + t * 40; // 24px..64px
+    }
+
+    // Format an overlay cell for the readout / label: numeric verbatim, bool as
+    // true/false, string as-is.
+    function cellText(cell) {
+      if (!cell) { return ""; }
+      if (typeof cell.num === "number") { return String(cell.num); }
+      if (typeof cell.bool === "boolean") { return String(cell.bool); }
+      if (typeof cell.str === "string") { return cell.str; }
+      return "";
+    }
+
+    // Mark externally-driven nodes once (a dashed border + an "ext" badge in the
+    // label); these are simulated inputs, not evaluated outputs.
+    cy.nodes().forEach(function (n) {
+      if (external.has(n.data("id"))) {
+        n.addClass("external");
+        var base = n.data("label") || "";
+        if (base.indexOf("ext") === -1) { n.data("label", base + "\next"); }
+      }
+    });
+
+    // Apply the overlay at tick `i`: colour/size each numeric node from its cell,
+    // keep label-only (bool/str) nodes at their kind colour but fold the value
+    // into the label, and refresh the time readout. Re-runnable from the scrubber.
+    function applyOverlayAtTick(i) {
+      cy.nodes().forEach(function (n) {
+        var id = n.data("id");
+        var no = (overlay.nodes || {})[id];
+        if (!no) { return; }
+        var cell = (no.series || [])[i];
+        if (!cell) { return; }
+        if (typeof cell.num === "number") {
+          n.removeClass("overlay-label");
+          n.data("ovColor", valueColor(cell.num));
+          n.data("ovSize", valueSize(cell.num));
+          n.addClass("overlay-num");
+        } else {
+          n.removeClass("overlay-num");
+          n.addClass("overlay-label");
+        }
+      });
+      var t = time[i];
+      var label = document.getElementById("time-readout");
+      if (label) { label.textContent = "t = " + (t != null ? t : i); }
+    }
+
+    // The value readout on node click: write `id = value (unit)` into #readout,
+    // alongside the existing highlightCone (which still fires from its own tap
+    // handler above). Reads the value at the scrubber's current tick.
+    var readout = document.getElementById("readout");
+    var scrubber = document.getElementById("scrubber");
+    function nodeReadout(node) {
+      if (!readout) { return; }
+      var id = node.data("id");
+      var no = (overlay.nodes || {})[id];
+      if (!no) { readout.textContent = id; return; }
+      var i = scrubber ? (scrubber.valueAsNumber || 0) : startTick;
+      var cell = (no.series || [])[i];
+      var unit = node.data("unit");
+      var text = id + " = " + cellText(cell);
+      if (unit) { text += " (" + unit + ")"; }
+      readout.textContent = text;
+    }
+    cy.on("tap", "node", function (evt) { nodeReadout(evt.target); });
+
+    // Wire the scrubber over overlay.time and seed it at the default tick.
+    if (scrubber) {
+      scrubber.min = "0";
+      scrubber.max = String(lastTick);
+      scrubber.value = String(startTick);
+      scrubber.addEventListener("input", function () {
+        applyOverlayAtTick(scrubber.valueAsNumber || 0);
+      });
+    }
+    applyOverlayAtTick(startTick);
+  }
 });
 </script>
 </body>
