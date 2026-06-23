@@ -1,0 +1,18 @@
+# Synthetic scenario for the m1-visualiser overlay end-to-end tests.
+# No proprietary MoTeC content; values chosen so the result is known.
+#
+# A `function` run over Demo.Update with Speed = 20 and Gain = 2.5, so the
+# computed Output = Speed * Gain = 50.0 on every tick — the value the overlay
+# round-trip assertions key on.
+mode = "function"
+target = "Demo.Update"
+duration_s = 0.03
+base_rate_hz = 100.0
+
+[[inputs]]
+channel = "Root.Demo.Speed"
+const = 20.0
+
+[[inputs]]
+channel = "Root.Demo.Gain"
+const = 2.5

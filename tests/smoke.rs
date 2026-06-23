@@ -3,6 +3,7 @@
 //! fixture project and assert that nodes/edges are produced and that the DOT,
 //! JSON and HTML renderers all emit non-trivial output.
 
+use m1_visualiser::eval::{self, ScenarioFormat};
 use m1_visualiser::model::EdgeKind;
 use m1_visualiser::{dot, html, json, loader};
 use std::path::PathBuf;
@@ -276,4 +277,237 @@ fn html_dot_json_all_render_from_full_fixture() {
         "no leftover placeholders"
     );
     assert!(page.contains("Root.Engine.Speed"), "graph data embedded");
+}
+
+// --- O10: end-to-end overlay integration + determinism + back-compat ----------
+
+/// The overlay fixture directory (`tests/fixtures/overlay/`): a `Root.Demo`
+/// group with `Speed`/`Gain`/`Output` and an `Update` function computing
+/// `Output = Speed * Gain`, plus a mutually-consistent scenario `.toml` and a
+/// `.csv` log so an override moves a known cone.
+fn overlay_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/overlay")
+}
+
+/// The overlay fixture's `.m1prj` and `.m1cfg` paths.
+fn overlay_paths() -> (PathBuf, PathBuf) {
+    let dir = overlay_dir();
+    (dir.join("Project.m1prj"), dir.join("parameters.m1cfg"))
+}
+
+/// Build the overlay fixture's structural model exactly as the CLI does, so its
+/// node ids are the canonical paths the trace/diff key by.
+fn load_overlay_model() -> m1_visualiser::model::GraphModel {
+    let (project, cfg) = overlay_paths();
+    loader::load(&project, Some(&cfg), Some("Overlay".into()))
+        .expect("overlay fixture project should load")
+}
+
+/// Read the GraphModel JSON embedded in a rendered HTML page (the renderer
+/// substitutes it into the `var GRAPH = <json>;` literal). Mirrors the CLI
+/// test's extractor so a smoke test can assert on the overlay the viewer reads.
+fn embedded_graph_json(html: &str) -> serde_json::Value {
+    let assign = html
+        .split("\nvar GRAPH =")
+        .nth(1)
+        .expect("page embeds a GRAPH assignment");
+    let literal = assign
+        .split(';')
+        .next()
+        .expect("GRAPH assignment terminated");
+    serde_json::from_str(literal.trim()).expect("embedded GRAPH JSON parses")
+}
+
+#[test]
+fn value_overlay_round_trips_through_html() {
+    // Load the overlay fixture, run the committed scenario through the real
+    // engine (Speed=20, Gain=2.5 ⇒ Output=50), attach the VALUE overlay, render
+    // HTML, and read it back out of the embedded GraphModel JSON. The page stays
+    // self-contained (Cytoscape inlined, placeholders consumed, no network).
+    let (project, cfg) = overlay_paths();
+    let model = load_overlay_model();
+    let scenario_src =
+        std::fs::read_to_string(overlay_dir().join("scenario.toml")).expect("scenario fixture");
+
+    let overlay = eval::run_value_scenario(
+        &project,
+        Some(&cfg),
+        &scenario_src,
+        ScenarioFormat::Toml,
+        &model.nodes,
+    )
+    .expect("scenario run produces a value overlay");
+    let model = model.with_overlay(overlay);
+
+    let page = html::render(&model);
+
+    // Self-contained: inlined Cytoscape, no leftover template placeholders.
+    assert!(page.contains("<!DOCTYPE html>"), "HTML doctype");
+    assert!(page.contains("cytoscape"), "Cytoscape.js inlined");
+    assert!(
+        !page.contains("/*__GRAPH_JSON__*/") && !page.contains("/*__CYTOSCAPE_JS__*/"),
+        "no leftover placeholders"
+    );
+
+    // The embedded JSON carries a value overlay with the known Output value.
+    let graph = embedded_graph_json(&page);
+    let embedded = &graph["overlay"];
+    assert_eq!(embedded["kind"], "value", "scenario yields a value overlay");
+    let series = embedded["nodes"]["Root.Demo.Output"]["series"]
+        .as_array()
+        .expect("Output node carries a series");
+    let last = series.last().expect("series is non-empty");
+    assert_eq!(
+        last["num"], 50.0,
+        "Output's last cell is 20 * 2.5 = 50; {last}"
+    );
+}
+
+#[test]
+fn diff_overlay_round_trips_through_html() {
+    // Log + override → DIFF overlay → HTML. Overriding the logged Speed (20 → 40)
+    // moves its downstream cone (Output), so the embedded overlay is `diff` and
+    // names the changed Output channel.
+    let (project, cfg) = overlay_paths();
+    let model = load_overlay_model();
+    let log_path = overlay_dir().join("run.csv");
+    let overrides = vec!["Root.Demo.Speed=40.0".to_string()];
+
+    let overlay = eval::run_diff(&project, Some(&cfg), &log_path, &overrides, &model.nodes)
+        .expect("override produces a diff overlay");
+    let model = model.with_overlay(overlay);
+
+    let page = html::render(&model);
+
+    // Self-contained still holds for the diff page.
+    assert!(page.contains("<!DOCTYPE html>"), "HTML doctype");
+    assert!(
+        !page.contains("/*__GRAPH_JSON__*/") && !page.contains("/*__CYTOSCAPE_JS__*/"),
+        "no leftover placeholders"
+    );
+
+    let graph = embedded_graph_json(&page);
+    let embedded = &graph["overlay"];
+    assert_eq!(
+        embedded["kind"], "diff",
+        "an override yields a diff overlay"
+    );
+    let changed: Vec<&str> = embedded["changed"]
+        .as_array()
+        .expect("changed array")
+        .iter()
+        .map(|v| v.as_str().expect("changed id is a string"))
+        .collect();
+    assert!(
+        changed.contains(&"Root.Demo.Output"),
+        "the overridden cone must include Output; got {changed:?}"
+    );
+}
+
+#[test]
+fn overlay_output_is_deterministic() {
+    // Building + rendering the same overlay twice must be byte-identical. The
+    // overlay's `BTreeMap` node map and sorted `changed` ids make this hold; this
+    // guards against any `HashMap` iteration-order leak in `eval.rs`. Exercised
+    // for both modes (value via scenario, diff via override) and all three
+    // renderers.
+    let (project, cfg) = overlay_paths();
+    let scenario_src =
+        std::fs::read_to_string(overlay_dir().join("scenario.toml")).expect("scenario fixture");
+    let log_path = overlay_dir().join("run.csv");
+    let overrides = vec!["Root.Demo.Speed=40.0".to_string()];
+
+    // Value mode: two independent build+render passes.
+    let value_a = {
+        let model = load_overlay_model();
+        let overlay = eval::run_value_scenario(
+            &project,
+            Some(&cfg),
+            &scenario_src,
+            ScenarioFormat::Toml,
+            &model.nodes,
+        )
+        .expect("value overlay (a)");
+        html::render(&model.with_overlay(overlay))
+    };
+    let value_b = {
+        let model = load_overlay_model();
+        let overlay = eval::run_value_scenario(
+            &project,
+            Some(&cfg),
+            &scenario_src,
+            ScenarioFormat::Toml,
+            &model.nodes,
+        )
+        .expect("value overlay (b)");
+        html::render(&model.with_overlay(overlay))
+    };
+    assert_eq!(
+        value_a, value_b,
+        "value-overlay HTML must be byte-identical across builds"
+    );
+
+    // Diff mode: two independent build+render passes, across all renderers.
+    let build_diff = || {
+        let model = load_overlay_model();
+        let overlay = eval::run_diff(&project, Some(&cfg), &log_path, &overrides, &model.nodes)
+            .expect("diff overlay");
+        model.with_overlay(overlay)
+    };
+    let diff_a = build_diff();
+    let diff_b = build_diff();
+    assert_eq!(
+        json::render(&diff_a),
+        json::render(&diff_b),
+        "diff-overlay JSON must be byte-identical"
+    );
+    assert_eq!(
+        dot::render(&diff_a),
+        dot::render(&diff_b),
+        "diff-overlay DOT must be byte-identical"
+    );
+    assert_eq!(
+        html::render(&diff_a),
+        html::render(&diff_b),
+        "diff-overlay HTML must be byte-identical"
+    );
+}
+
+#[test]
+fn no_overlay_output_matches_v1() {
+    // Back-compat proof at the integration level: an un-overlaid render of the
+    // overlay fixture is byte-identical to the structural (v1) render across all
+    // three renderers, and the HTML embeds no `"overlay"` key.
+    let structural = load_overlay_model();
+    // `with_overlay` is the only overlay seam; never calling it must leave the
+    // model — and therefore every renderer's output — exactly as v1.
+    assert!(
+        structural.overlay.is_none(),
+        "a freshly loaded model carries no overlay"
+    );
+
+    let json_a = json::render(&load_overlay_model());
+    let json_b = json::render(&structural);
+    assert_eq!(json_a, json_b, "structural JSON is stable");
+
+    let page = html::render(&structural);
+    let graph = embedded_graph_json(&page);
+    assert!(
+        graph.get("overlay").is_none(),
+        "an un-overlaid page must embed no overlay; got {graph}"
+    );
+
+    // The renderers' output on an un-overlaid model is identical to a second
+    // independently loaded copy — i.e. the v1 path is untouched.
+    let reloaded = load_overlay_model();
+    assert_eq!(
+        dot::render(&reloaded),
+        dot::render(&structural),
+        "structural DOT is unchanged"
+    );
+    assert_eq!(
+        html::render(&reloaded),
+        page,
+        "structural HTML is unchanged"
+    );
 }

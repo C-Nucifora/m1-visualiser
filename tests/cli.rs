@@ -530,6 +530,85 @@ fn cli_ld_log_without_feature_fails_loud() {
         .code(1);
 }
 
+// ---- O10: committed overlay fixtures drive the binary end-to-end ----
+
+/// The committed sample scenario `.toml` shipped under `tests/fixtures/overlay/`.
+fn overlay_scenario_file() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/overlay/scenario.toml")
+}
+
+/// The committed sample `.csv` log shipped under `tests/fixtures/overlay/`.
+fn overlay_log_file() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/overlay/run.csv")
+}
+
+#[test]
+fn cli_committed_scenario_fixture_round_trips() {
+    // The committed scenario `.toml` (not an inline string) runs through the
+    // binary to a VALUE overlay carrying the known Output = 20 * 2.5 = 50.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let html = dir.path().join("graph.html");
+
+    Command::cargo_bin("m1-visualiser")
+        .expect("binary builds")
+        .arg("--project")
+        .arg(overlay_project())
+        .arg("--overlay-scenario")
+        .arg(overlay_scenario_file())
+        .arg("--out")
+        .arg(&html)
+        .assert()
+        .success();
+
+    let page = std::fs::read_to_string(&html).expect("html written");
+    let graph = embedded_graph_json(&page);
+    assert_eq!(graph["overlay"]["kind"], "value");
+    let series = graph["overlay"]["nodes"]["Root.Demo.Output"]["series"]
+        .as_array()
+        .expect("Output node has a series");
+    assert_eq!(
+        series.last().expect("non-empty series")["num"],
+        50.0,
+        "committed scenario yields Output = 50"
+    );
+}
+
+#[test]
+fn cli_committed_log_fixture_diff_marks_changed() {
+    // The committed `.csv` log + an override drives a DIFF overlay through the
+    // binary, flagging the moved Output cone — proving the committed fixtures are
+    // mutually consistent (Output = Speed * Gain) so an override has a known cone.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let html = dir.path().join("graph.html");
+
+    Command::cargo_bin("m1-visualiser")
+        .expect("binary builds")
+        .arg("--project")
+        .arg(overlay_project())
+        .arg("--overlay-log")
+        .arg(overlay_log_file())
+        .arg("--override")
+        .arg("Root.Demo.Speed=40.0")
+        .arg("--out")
+        .arg(&html)
+        .assert()
+        .success();
+
+    let page = std::fs::read_to_string(&html).expect("html written");
+    let graph = embedded_graph_json(&page);
+    assert_eq!(graph["overlay"]["kind"], "diff");
+    let changed: Vec<&str> = graph["overlay"]["changed"]
+        .as_array()
+        .expect("changed array")
+        .iter()
+        .map(|v| v.as_str().expect("changed id is a string"))
+        .collect();
+    assert!(
+        changed.contains(&"Root.Demo.Output"),
+        "committed log + override moves the Output cone; got {changed:?}"
+    );
+}
+
 /// Sanity guard: the fixture project the simple tests rely on exists.
 #[test]
 fn fixture_project_exists() {
@@ -537,5 +616,16 @@ fn fixture_project_exists() {
         Path::new(&fixture_project()).is_file(),
         "expected fixture at {}",
         fixture_project().display()
+    );
+    // The committed overlay fixtures the O10 round-trip tests rely on exist too.
+    assert!(
+        Path::new(&overlay_scenario_file()).is_file(),
+        "expected overlay scenario fixture at {}",
+        overlay_scenario_file().display()
+    );
+    assert!(
+        Path::new(&overlay_log_file()).is_file(),
+        "expected overlay log fixture at {}",
+        overlay_log_file().display()
     );
 }
