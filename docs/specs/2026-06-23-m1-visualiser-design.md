@@ -1,7 +1,8 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # m1-visualiser design
 
-Status: v1 complete (structural-first). Last updated 2026-06-23.
+Status: v1 complete (structural-first); value/diff overlay shipped. Last updated
+2026-06-23.
 
 ## Purpose
 
@@ -18,14 +19,14 @@ diffing, and rendering with other tooling.
 
 ## Phasing
 
-- **v1 — structural-first (this build).** Build the graph purely from the
-  project's static structure as reported by `m1-typecheck`'s symbol table. No
-  numeric values. All four edge types below — hierarchy, table-axis, schedule,
-  and data-flow — are implemented, alongside the interactive viewer.
-- **Later — value overlay.** Overlay computed numeric values (channel results,
-  table lookups, parameter values) onto nodes by consuming `m1-eval`. This is
-  explicitly **not** part of the structural v1 and adds `m1-eval` as a
-  dependency only when that workflow lands.
+- **v1 — structural-first.** Build the graph purely from the project's static
+  structure as reported by `m1-typecheck`'s symbol table. No numeric values. All
+  four edge types below — hierarchy, table-axis, schedule, and data-flow — are
+  implemented, alongside the interactive viewer.
+- **Value + diff overlay (shipped).** Overlay computed numeric values (channel
+  results, table lookups, parameter values) onto nodes by consuming `m1-eval`.
+  This is opt-in: with no overlay flag the binary is byte-for-byte the v1 tool.
+  See [Value + diff overlay](#value--diff-overlay) below.
 
 ## The four edge types
 
@@ -88,19 +89,21 @@ Each `GraphNode` carries its dotted `path`, an `id`, its `kind`, an optional
 The crate mirrors `m1-doc`'s `loader -> model -> renderers` shape:
 
 ```
-Project (m1-typecheck)
-   │  loader.rs   (all m1-typecheck / m1-core I/O lives here)
-   ▼
-GraphModel (model.rs — toolchain-agnostic; no m1-typecheck types leak past here)
-   │
+Project (m1-typecheck)                    Trace / Counterfactual (m1-eval)
+   │  loader.rs   (m1-typecheck / m1-core)     │  eval.rs   (m1-eval airlock)
+   ▼                                           ▼
+GraphModel (model.rs — toolchain-agnostic) ◄── Overlay  (model.rs; folded on via
+   │            no toolchain type leaks past here          GraphModel::with_overlay)
    ├─ dot.rs   → Graphviz DOT
    ├─ json.rs  → JSON
    └─ html.rs  → self-contained interactive HTML (Cytoscape.js)
 ```
 
-`loader.rs` is the only module that touches `m1-typecheck` / `m1-core` types;
-everything downstream reads the plain `GraphModel`. This matches `m1-doc`, where
-`loader.rs` builds a `DocModel` that the markdown/html renderers consume.
+`loader.rs` is the only module that touches `m1-typecheck` / `m1-core` types,
+and `eval.rs` is the symmetric airlock — the only module that touches `m1-eval`.
+Both produce plain `model.rs` types (a `GraphModel`, an `Overlay`) that the
+renderers consume; no toolchain type leaks past either. This matches `m1-doc`,
+where `loader.rs` builds a `DocModel` that the markdown/html renderers consume.
 
 ## Dependencies
 
@@ -112,25 +115,101 @@ everything downstream reads the plain `GraphModel`. This matches `m1-doc`, where
   data-flow read/write analysis (`dataflow::io_sets`, a self-contained port of
   the read/write summary logic from `m1-eval/src/summary.rs`, kept in-crate so
   the structural build takes no `m1-eval` dependency).
-- **`m1-eval` (value overlay, later only).** Not a dependency of this structural
-  v1. Added when the numeric value-overlay workflow lands.
+- **`m1-eval` (value + diff overlay).** Pinned to `v0.1.0`. The numeric
+  value/diff overlay's only source of computed values; consumed exclusively by
+  `eval.rs` (the airlock — see below), so no `m1-eval` type leaks past it. Its
+  optional `ld` feature is re-exported as this crate's own `ld` feature
+  (`ld = ["m1-eval/ld"]`); off by default, so a binary `.ld` overlay log fails
+  loud through the engine (naming the feature) unless built with `--features ld`,
+  while `.csv` logs always work. `m1-eval` pins the **same** `m1-typecheck
+  v0.36.0` this crate's loader does, so a trace/diff channel path and a graph
+  node id are the same canonical string — the join key (below) needs no fuzzy
+  matching.
+
+## Value + diff overlay
+
+The overlay attaches `m1-eval`'s computed values to the structural graph. It is
+**opt-in**: with no overlay flag the binary is byte-for-byte the structural v1
+tool (same default HTML/JSON/DOT, same loader path), so back-compatibility is a
+locked invariant. There are **two modes**:
+
+1. **Value overlay** — run `m1-eval` against the project to get a `Trace`, then
+   attach each channel/function node's per-tick value. Two sources:
+   `--overlay-scenario <FILE>` (a `.toml`/`.json` scenario, run via
+   `Engine::run`) and `--overlay-log <FILE>` with no override (a recorded `.csv`
+   /`.ld` run, sampled onto its keyframe grid). The viewer colours/sizes nodes by
+   value, ships a time scrubber over `overlay.time`, a value readout on node
+   click, and a dashed-border distinction for externally-driven channels.
+2. **Diff overlay** — `--overlay-log <FILE> --override "CH=value-or-expr"`
+   (override repeatable) replays the log as ground truth, layers the overrides,
+   recomputes only the downstream cone, and diffs against the log
+   (`Engine::run_counterfactual_diff` → `Counterfactual { trace, diff }`). The
+   viewer highlights the changed cone (reusing the structural cone-highlight UX),
+   colours nodes by `max_abs_delta`, and steps the per-tick delta on the
+   scrubber. The **no-op invariant** holds: with no override the changed set is
+   empty, so nothing is highlighted.
+
+`--at-time <SECONDS>` records the scrubber's initial tick (nearest index in
+`overlay.time`); the full series is always embedded so the scrubber still works.
+`--overlay-scenario` and `--overlay-log` are mutually exclusive, and `--override`
+requires `--overlay-log` — both are fail-loud usage errors.
+
+### The join key
+
+A `GraphNode.id` is the symbol's dotted path (e.g. `Root.Demo.Output`);
+`Trace::channels` and `Diff::channels` are keyed by the **same** canonical paths
+the `m1-eval` runner emits, because both crates pin the same `m1-typecheck
+v0.36.0` and load the same `Project`. So the join is a direct `node.id ==
+channel path` lookup — **no fuzzy matching**. A trace/diff channel with no
+matching node (a builtin or an expression column) is ignored; a node with no
+trace column (an unscheduled function, an untouched constant) renders neutral.
+
+### The overlay JSON shape
+
+The overlay rides **inside the same `GraphModel` JSON** the v1 viewer already
+embeds — one self-contained document, no second embedded payload, no network.
+`model.rs` carries it as `GraphModel { …, overlay: Option<Overlay> }`, with
+`#[serde(skip_serializing_if = "Option::is_none")]` so an un-overlaid model
+serialises byte-identically to v1. The shape:
+
+```jsonc
+"overlay": {
+  "kind": "value" | "diff",        // overlay mode
+  "time": [0.0, 0.01, …],          // shared tick axis (seconds)
+  "nodes": {                       // node-id -> per-node overlay (BTreeMap: sorted)
+    "Root.Demo.Output": {
+      "series": [{"num": 50.0}, …],// one ramp-aware cell per tick:
+                                   //   {"num": f64} | {"bool": b} | {"str": s}
+      "delta": [5.0, …],           // per-tick delta            (diff mode only)
+      "max_abs_delta": 5.0         // colour-ramp summary       (diff mode only)
+    }
+  },
+  "external": ["Root.Demo.Speed"], // externally-driven node ids (value mode)
+  "changed": ["Root.Demo.Output"], // changed node ids (diff mode; empty in value)
+  "eps": 1e-9,                      // diff threshold            (diff mode only)
+  "start_tick": 0                  // scrubber's initial tick   (--at-time hint)
+}
+```
+
+`OverlayCell` is tagged (`num`/`bool`/`str`) so the viewer knows which nodes are
+numeric-rampable versus label-only, and shows a faithful readout for enums and
+strings. The `nodes` map is a `BTreeMap` and `changed` is sorted, so the rendered
+JSON/HTML/DOT are byte-deterministic across builds (no `HashMap` iteration leak).
 
 ## Deferred (later workflows)
 
-The structural v1 is complete: all four edge kinds (hierarchy, table-axis,
-schedule, data-flow) are extracted, and the interactive viewer ships search,
-per-edge-kind filters, collapse/expand of compound subsystems, and
-dependency-cone highlight. The only deferred workflow is:
+The structural v1 and the value/diff overlay are both complete. Remaining seams:
 
-- **Value overlay.** Overlaying computed numeric values on nodes (channel
-  results, table lookups, parameter values) by consuming `m1-eval`. This is a
-  separate workflow that adds `m1-eval` as a dependency; until then the graph is
-  purely structural.
-
-A documented seam remains for richer layered routing — vendoring the
-`dagre`/`elk` Cytoscape layout extensions the same way the core library is
-vendored under `templates/` — but v1 ships only core Cytoscape layouts and adds
-no second vendored asset.
+- **Richer layered routing.** Vendoring the `dagre`/`elk` Cytoscape layout
+  extensions the same way the core library is vendored under `templates/`; the
+  shipped viewer uses only core Cytoscape layouts and adds no second vendored
+  asset.
+- **Per-expression overlay.** The overlay keys on channel/function **nodes**
+  only; `m1-eval`'s per-expression `(script, byte_offset)` trace sink onto
+  sub-node sites is a documented later seam.
+- **In-browser re-runs.** The HTML is a static, self-contained snapshot; editing
+  values or re-running the engine from the page is out of scope — a re-run is a
+  CLI re-invocation.
 
 ## Notes
 
