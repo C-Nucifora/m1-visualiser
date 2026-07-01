@@ -40,7 +40,16 @@ const CYTOSCAPE_JS: &str = include_str!("../templates/cytoscape.min.js");
 /// Render the model as a single self-contained interactive HTML document.
 pub fn render(model: &GraphModel) -> String {
     let title = model.title.as_deref().unwrap_or("M1 Project");
-    let graph_json = json::render_compact(model);
+    // Escape the three script-context-significant characters to their JSON
+    // \uXXXX unicode escapes. In valid JSON these characters only ever appear
+    // inside string values, so the escapes stay valid JSON/JS while ensuring a
+    // string field containing `</script>` (e.g. a channel/annotation name)
+    // cannot terminate the inline `<script>` element and inject markup into the
+    // exported HTML.
+    let graph_json = json::render_compact(model)
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026");
 
     // Substitute the three placeholders. Order matters only in that none of the
     // replacements introduce another placeholder.
@@ -51,9 +60,10 @@ pub fn render(model: &GraphModel) -> String {
 }
 
 /// Minimal text escaping for the title interpolated into element text / the
-/// `<title>`. The graph JSON is *not* escaped this way — it is valid JS embedded
-/// in a `<script>` and contains no `</script>` because node ids are dotted
-/// component paths.
+/// `<title>`. The graph JSON is escaped separately in [`render`]: its
+/// script-significant characters (`<`, `>`, `&`) are rewritten to JSON `\uXXXX`
+/// unicode escapes so a string field containing `</script>` cannot close the
+/// inline `<script>` element early or inject markup.
 fn html_escape_text(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -181,6 +191,33 @@ mod tests {
         g.nodes.push(GraphNode::new("X", NodeKind::Group));
         let html = render(&g);
         assert!(html.contains("A&lt;b&gt;&amp;c"));
+    }
+
+    #[test]
+    fn embedded_json_escapes_script_close() {
+        // A node id (a string field that rides verbatim into the embedded GRAPH
+        // JSON) containing a `</script>` sequence must not be able to terminate
+        // the inline `<script>` element early and inject markup into the exported
+        // HTML. The renderer HTML-escapes the script-significant characters to
+        // their JSON \uXXXX unicode escapes, which stay valid JSON/JS while never
+        // closing the script tag.
+        let mut g = GraphModel::new(Some("Demo".into()));
+        g.nodes.push(GraphNode::new(
+            "Root.</script><img src=x onerror=alert(1)>",
+            NodeKind::Channel,
+        ));
+        let html = render(&g);
+        // The raw injection payload must not appear (which would break out of the
+        // <script> and inject an <img> into the document).
+        assert!(
+            !html.contains("</script><img"),
+            "raw </script><img injection leaked into the exported HTML"
+        );
+        // Instead the `<` is embedded as its JSON unicode escape.
+        assert!(
+            html.contains("\\u003c/script"),
+            "expected the script-close to be embedded as its \\u003c escape"
+        );
     }
 
     #[test]
