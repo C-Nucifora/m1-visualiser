@@ -331,12 +331,18 @@ mod tests {
             .map(f64::abs)
             .filter(|d| d.is_finite())
             .fold(0.0_f64, f64::max);
-        let changed = max_abs_delta > eps;
+        let non_finite_mismatches = counterfactual
+            .iter()
+            .zip(logged)
+            .filter(|(cf, lg)| cf.is_finite() != lg.is_finite())
+            .count();
+        let changed = max_abs_delta > eps || non_finite_mismatches > 0;
         ChannelDiff {
             logged: logged.to_vec(),
             counterfactual: counterfactual.to_vec(),
             delta,
             max_abs_delta,
+            non_finite_mismatches,
             changed,
         }
     }
@@ -370,6 +376,8 @@ mod tests {
                 time,
                 channels,
                 eps,
+                mapping: std::collections::BTreeMap::new(),
+                ambiguous: Vec::new(),
             },
         }
     }
