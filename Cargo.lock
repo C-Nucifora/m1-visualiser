@@ -268,7 +268,7 @@ source = "git+https://github.com/C-Nucifora/m1-eval.git?tag=v0.4.1#a699484eaca38
 dependencies = [
  "clap",
  "m1-core",
- "m1-typecheck",
+ "m1-typecheck 0.50.0",
  "motec-i2",
  "roxmltree",
  "serde",
@@ -291,6 +291,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "m1-typecheck"
+version = "0.51.0"
+source = "git+https://github.com/C-Nucifora/m1-typecheck.git?tag=v0.51.0#e79bd0e4686cae078b1f96a728f2f94affc3ede4"
+dependencies = [
+ "clap",
+ "m1-core",
+ "m1-workspace",
+ "roxmltree",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "m1-visualiser"
 version = "0.1.6"
 dependencies = [
@@ -298,7 +312,7 @@ dependencies = [
  "clap",
  "m1-core",
  "m1-eval",
- "m1-typecheck",
+ "m1-typecheck 0.51.0",
  "serde",
  "serde_json",
  "tempfile",
