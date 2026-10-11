@@ -192,8 +192,9 @@ pub fn diff_overlay(cf: &Counterfactual, nodes: &[GraphNode]) -> Overlay {
 
 /// Map one `m1-eval` [`Value`] to a faithful, ramp-aware [`OverlayCell`].
 ///
-/// Numeric values (`Float`/`Int`/`Uint`) become [`OverlayCell::Num`] via
-/// [`Value::as_f64`], so the viewer applies a colour/size ramp. A `Bool` becomes
+/// Numeric M1 scalars become [`OverlayCell::Num`] via
+/// [`m1_eval::M1Scalar::as_f64`], so the viewer applies a colour/size ramp.
+/// A `Bool` becomes
 /// [`OverlayCell::Bool`]; an `Enum` or `Str` becomes [`OverlayCell::Str`] of its
 /// display form (the enum's member name, matching the trace's own rendering) so
 /// it is shown verbatim but never ramped.
@@ -202,13 +203,7 @@ fn value_cell(value: &Value) -> OverlayCell {
         Value::Bool(b) => OverlayCell::Bool(*b),
         Value::Enum { member, .. } => OverlayCell::Str(member.clone()),
         Value::Str(s) => OverlayCell::Str(s.clone()),
-        // `Float`/`Int`/`Uint` are exactly the variants `as_f64` accepts, so the
-        // coercion cannot fail here; fall back to a string cell defensively
-        // rather than panicking if `m1-eval` ever broadens the numeric set.
-        numeric => match numeric.as_f64() {
-            Ok(x) => OverlayCell::Num(x),
-            Err(_) => OverlayCell::Str(format!("{numeric:?}")),
-        },
+        Value::M1(numeric) => OverlayCell::Num(numeric.as_f64()),
     }
 }
 
@@ -360,7 +355,9 @@ mod tests {
                 .map(|(path, cf, _)| {
                     (
                         *path,
-                        cf.iter().map(|v| Value::Float(*v)).collect::<Vec<_>>(),
+                        cf.iter()
+                            .map(|v| Value::m1_float(*v as f32))
+                            .collect::<Vec<_>>(),
                     )
                 })
                 .collect::<Vec<_>>(),
@@ -383,11 +380,22 @@ mod tests {
     }
 
     #[test]
+    fn scalar_overlay_cells_preserve_numeric_widths() {
+        for (value, expected) in [
+            (Value::m1_float(1.5), 1.5),
+            (Value::m1_integer(i32::MIN), f64::from(i32::MIN)),
+            (Value::m1_unsigned(u32::MAX), f64::from(u32::MAX)),
+        ] {
+            assert_eq!(value_cell(&value), OverlayCell::Num(expected));
+        }
+    }
+
+    #[test]
     fn value_overlay_keys_by_node_id() {
         let trace = trace_with(
             &[(
                 "Root.Demo.Output",
-                vec![Value::Float(50.0), Value::Float(50.0)],
+                vec![Value::m1_float(50.0), Value::m1_float(50.0)],
             )],
             vec![0.0, 0.01],
         );
@@ -411,8 +419,8 @@ mod tests {
         // entry — no spurious keys leak into the overlay.
         let trace = trace_with(
             &[
-                ("Root.Demo.Output", vec![Value::Float(1.0)]),
-                ("Root.Builtin.Hidden", vec![Value::Float(2.0)]),
+                ("Root.Demo.Output", vec![Value::m1_float(1.0)]),
+                ("Root.Builtin.Hidden", vec![Value::m1_float(2.0)]),
             ],
             vec![0.0],
         );
@@ -429,8 +437,8 @@ mod tests {
     fn external_channels_are_flagged() {
         let mut trace = trace_with(
             &[
-                ("Root.Demo.Speed", vec![Value::Float(20.0)]),
-                ("Root.Demo.Output", vec![Value::Float(50.0)]),
+                ("Root.Demo.Speed", vec![Value::m1_float(20.0)]),
+                ("Root.Demo.Output", vec![Value::m1_float(50.0)]),
             ],
             vec![0.0],
         );
@@ -460,7 +468,7 @@ mod tests {
                     }],
                 ),
                 ("Root.Demo.Armed", vec![Value::Bool(true)]),
-                ("Root.Demo.Output", vec![Value::Float(50.0)]),
+                ("Root.Demo.Output", vec![Value::m1_float(50.0)]),
             ],
             vec![0.0],
         );
