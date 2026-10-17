@@ -86,15 +86,17 @@ struct Walker<'a> {
 }
 
 impl Walker<'_> {
-    /// Walk a node, dispatching assignments specially and recursing elsewhere.
+    /// Walk statements in source order without recursing over script nesting.
     fn walk(&mut self, node: &Node) {
-        match node.kind() {
-            Kind::LocalDeclaration => self.walk_local_decl(node),
-            Kind::AssignmentStatement => self.walk_assignment(node),
-            _ => {
-                for child in node.named_children() {
-                    self.walk(&child);
+        let mut pending = vec![*node];
+        while let Some(node) = pending.pop() {
+            match node.kind() {
+                Kind::LocalDeclaration => self.walk_local_decl(&node),
+                Kind::AssignmentStatement => self.walk_assignment(&node),
+                Kind::Identifier | Kind::MemberExpression | Kind::CallExpression => {
+                    self.walk_reads(&node)
                 }
+                _ => pending.extend(node.named_children().into_iter().rev()),
             }
         }
     }
@@ -139,37 +141,24 @@ impl Walker<'_> {
 
     /// Walk an expression position, recording each project-symbol reference as a
     /// read. Member expressions are flattened to a path and resolved as a unit;
-    /// other nodes recurse so nested calls/operands are covered.
+    /// other nodes add their children to the work stack for nested operands.
     fn walk_reads(&mut self, node: &Node) {
-        match node.kind() {
-            Kind::Identifier => {
-                if let Some(path) = self.canonical_symbol(node) {
-                    self.sets.reads.insert(path);
+        let mut pending = vec![*node];
+        while let Some(node) = pending.pop() {
+            match node.kind() {
+                Kind::Identifier | Kind::MemberExpression => {
+                    // Resolve the whole member chain, not its individual segments.
+                    if let Some(path) = self.canonical_symbol(&node) {
+                        self.sets.reads.insert(path);
+                    }
                 }
-            }
-            Kind::MemberExpression => {
-                // A member chain like `A.B.C` is one reference. If its head is a
-                // builtin object (e.g. `Calculate.PI`) or it does not resolve to a
-                // project symbol, `canonical_symbol` returns None and we skip it.
-                if let Some(path) = self.canonical_symbol(node) {
-                    self.sets.reads.insert(path);
+                Kind::CallExpression => {
+                    // Arguments are reads; the function or method callee is not.
+                    if let Some(args) = node.child_by_field(Field::Arguments) {
+                        pending.push(args);
+                    }
                 }
-                // Do not recurse into the member's segments — they are not
-                // independent references. (A `MemberExpression` used as a call
-                // *callee* is handled by the CallExpression arm below, which only
-                // walks the argument list.)
-            }
-            Kind::CallExpression => {
-                // The callee is `Object.Method` (a builtin or table); we do not
-                // count it as a channel read. The arguments, however, are reads.
-                if let Some(args) = node.child_by_field(Field::Arguments) {
-                    self.walk_reads(&args);
-                }
-            }
-            _ => {
-                for child in node.named_children() {
-                    self.walk_reads(&child);
-                }
+                _ => pending.extend(node.named_children().into_iter().rev()),
             }
         }
     }
@@ -261,21 +250,21 @@ fn classify(
     }
 }
 
-/// Flatten a `MemberExpression` to its dotted source path. The `object` may
-/// itself be a member expression (`A.B.C`), so recurse; each segment is taken
-/// verbatim (it may contain spaces). Only `.` joins segments — never whitespace.
-/// Ported from `m1-eval/src/expr.rs::flatten_member` with its `Result` collapsed
-/// to `Option` (a malformed member yields `None`).
+/// Flatten a member chain without recursing over its depth. Each segment is
+/// taken verbatim, including spaces; only `.` joins segments.
 fn flatten_member(node: &Node) -> Option<String> {
-    let object = node.child_by_field(Field::Object)?;
-    let property = node.child_by_field(Field::Property)?;
-
-    let head = match object.kind() {
-        Kind::MemberExpression => flatten_member(&object)?,
-        // Identifier (or any leaf) — its text is the segment verbatim.
-        _ => object.text().to_string(),
-    };
-    Some(format!("{head}.{}", property.text()))
+    let mut current = *node;
+    let mut tail = Vec::new();
+    while current.kind() == Kind::MemberExpression {
+        tail.push(current.child_by_field(Field::Property)?.text());
+        current = current.child_by_field(Field::Object)?;
+    }
+    let mut path = current.text().to_string();
+    for segment in tail.into_iter().rev() {
+        path.push('.');
+        path.push_str(segment);
+    }
+    Some(path)
 }
 
 /// Rewrite a leading `This` anchor to the enclosing group's canonical path
