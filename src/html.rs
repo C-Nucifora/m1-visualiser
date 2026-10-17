@@ -51,12 +51,15 @@ pub fn render(model: &GraphModel) -> String {
         .replace('>', "\\u003e")
         .replace('&', "\\u0026");
 
-    // Substitute the three placeholders. Order matters only in that none of the
-    // replacements introduce another placeholder.
+    // Only replace tokens in the template, never in project-derived strings.
     VIEWER_HTML
-        .replace("/*__CYTOSCAPE_JS__*/", CYTOSCAPE_JS)
-        .replace(GRAPH_JSON_TOKEN, &graph_json)
-        .replace("__TITLE__", &html_escape_text(title))
+        .split("__TITLE__")
+        .map(|part| {
+            part.replace("/*__CYTOSCAPE_JS__*/", CYTOSCAPE_JS)
+                .replace(GRAPH_JSON_TOKEN, &graph_json)
+        })
+        .collect::<Vec<_>>()
+        .join(&html_escape_text(title))
 }
 
 /// Minimal text escaping for the title interpolated into element text / the
