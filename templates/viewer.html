@@ -582,11 +582,13 @@ document.addEventListener("DOMContentLoaded", function () {
       var t = time[i];
       var label = document.getElementById("time-readout");
       if (label) { label.textContent = "t = " + (t != null ? t : i); }
+      if (selectedNode) { nodeReadout(selectedNode); }
     }
 
     // The value readout on node click: write `id = value (unit)` into #readout,
     // alongside the existing highlightCone (which still fires from its own tap
     // handler above). Reads the value at the scrubber's current tick.
+    var selectedNode = null;
     var readout = document.getElementById("readout");
     var scrubber = document.getElementById("scrubber");
     function nodeReadout(node) {
@@ -601,7 +603,10 @@ document.addEventListener("DOMContentLoaded", function () {
       if (unit) { text += " (" + unit + ")"; }
       readout.textContent = text;
     }
-    cy.on("tap", "node", function (evt) { nodeReadout(evt.target); });
+    cy.on("tap", "node", function (evt) {
+      selectedNode = evt.target;
+      nodeReadout(selectedNode);
+    });
 
     // Wire the scrubber over overlay.time and seed it at the default tick.
     if (scrubber) {
@@ -668,6 +673,7 @@ document.addEventListener("DOMContentLoaded", function () {
       return (typeof v === "number" && isFinite(v)) ? String(v) : "—";
     }
 
+    var dSelectedNode = null;
     var dReadout = document.getElementById("readout");
     var dScrubber = document.getElementById("scrubber");
 
@@ -697,6 +703,7 @@ document.addEventListener("DOMContentLoaded", function () {
       var t = dtime[i];
       var dlabel = document.getElementById("time-readout");
       if (dlabel) { dlabel.textContent = "t = " + (t != null ? t : i); }
+      if (dSelectedNode) { diffReadout(dSelectedNode); }
     }
 
     // The diff readout on node click: `id: logged → counterfactual (Δ delta)` for
@@ -716,7 +723,10 @@ document.addEventListener("DOMContentLoaded", function () {
       dReadout.textContent = id + ": " + diffNum(logged) + " → " + diffNum(cf) +
         " (Δ " + diffNum(delta) + ")";
     }
-    cy.on("tap", "node", function (evt) { diffReadout(evt.target); });
+    cy.on("tap", "node", function (evt) {
+      dSelectedNode = evt.target;
+      diffReadout(dSelectedNode);
+    });
 
     // Wire the scrubber over overlay.time and seed it at the default tick.
     if (dScrubber) {
