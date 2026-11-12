@@ -68,11 +68,18 @@ graph carries no such caveat — it reflects the project as parsed.
 ## Scope and limitations
 
 - **Read-only.** The visualiser never modifies a project. Structured edits
-  belong to [`m1-project`](https://github.com/nedlane/m1-project).
+  belong to [`m1-project`](https://github.com/nedlane/m1-project). Output writes
+  replace a generated file atomically and reject symlinks or aliases of loaded
+  inputs, including hardlinks.
 - **Structure from the symbol table.** Nodes/edges come from `m1-typecheck`'s
   symbol model plus per-script CST analysis; anything that model cannot resolve
   (e.g. `$(…)`-parameterised triggers) is absent from the graph rather than
-  guessed.
+  guessed. Discovery/read errors and ambiguous used script basenames fail the
+  export. An explicit relative script filename selects its exact source.
+  Symlinked source files and directories are rejected.
+- **User calls.** A project function/method whose result is used contributes a
+  dependency into its caller. Builtin callees stay excluded. Side-effect-only
+  calls do not have an activation or ordering model in this graph.
 - **Self-contained HTML.** The viewer embeds a vendored Cytoscape and escapes
   all project-derived strings; it makes no network requests.
 
@@ -82,6 +89,7 @@ graph carries no such caveat — it reflects the project as parsed.
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
+node tests/viewer.cjs
 ```
 
 ## License

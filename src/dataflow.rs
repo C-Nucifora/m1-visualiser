@@ -5,38 +5,12 @@
 //! the script *writes* and the set it *reads*, so the loader can emit data-flow
 //! edges (`read -> function`, `function -> write`).
 //!
-//! This is a port of `m1-eval/src/summary.rs` (`io_sets`) and the small helpers
-//! it depends on — `classify` (from `m1-eval/src/ident.rs`), `flatten_member`
-//! and `rewrite_this` (from `m1-eval/src/expr.rs`). Both crates are ours and
-//! GPL-3.0-or-later, so copying our own code is fine; we copy rather than depend
-//! on `m1-eval` so the structural crate does **not** take an `m1-eval`
-//! dependency (the design doc forbids that until the value-overlay workflow).
-//!
-//! Divergences from the originals, all behaviour-preserving for read/write
-//! extraction:
-//!
-//! - `m1-eval`'s `Walker.locals` is a `HashMap<String, Value>`; the values are
-//!   only ever used as a *set of local names*, never read, so here it is a
-//!   `HashSet<String>`. `classify` builds its `Scope.locals` with
-//!   `ValueType::Unknown` for each name, exactly as `ident.rs` does.
-//! - `flatten_member` / `rewrite_this` returned `Result<_, EvalError>` /
-//!   `Option` in `expr.rs`; here both collapse to `Option` since the walker only
-//!   needs the happy path (a malformed member just yields no read).
-//!
-//! The extraction rules (verified against `summary.rs`):
-//!
-//! - the left-hand side of an `AssignmentStatement` is a **write**;
-//! - a compound assignment (`+=`, `*=`, …) reads its target first, so a compound
-//!   target is **both** a read and a write;
-//! - every other identifier/member reference in a value position is a **read**;
-//! - a `CallExpression` callee (`Calculate.Max`) is **not** a read, but its
-//!   arguments are walked for reads.
-//!
-//! Only *project symbols* land in the sets — function-locals, builtin library
-//! objects, and the `In`/`Out`/`This` anchors are excluded. Names are
-//! canonicalised through `classify` (and a leading `This` is rewritten to the
-//! enclosing group first), so `Speed`, `This.Speed`, and `Root.Demo.Speed` all
-//! collapse to one path.
+//! Names resolve through `m1-typecheck`'s project resolver, including locals,
+//! library precedence and This/Parent anchors. Assignment targets are writes;
+//! compound targets are also reads. Call arguments remain reads, and a resolved
+//! project Function/Method contributes a read when its return value is used.
+//! Builtin callees and discarded call results do not add return dependencies.
+//! This does not model the activation or ordering of side-effect-only calls.
 //!
 //! Identifiers may contain spaces; paths are only ever split on `.`.
 
@@ -45,6 +19,7 @@ use m1_typecheck::Project;
 use m1_typecheck::ValueType;
 use m1_typecheck::parsed::ParsedScript;
 use m1_typecheck::resolve::{Resolution, Scope, resolve};
+use m1_typecheck::symbols::SymbolKind;
 use std::collections::{BTreeSet, HashSet};
 
 /// The canonical read/write sets of one function's body.
@@ -153,7 +128,17 @@ impl Walker<'_> {
                     }
                 }
                 Kind::CallExpression => {
-                    // Arguments are reads; the function or method callee is not.
+                    // A used project return value depends on its callee. Standalone
+                    // calls need an effects model, which this read/write pass lacks.
+                    if return_value_is_used(&node)
+                        && let Some(callee) = node.child_by_field(Field::Function)
+                        && let Some(path) = self.canonical_symbol(&callee)
+                        && self.project.symbols().get(&path).is_some_and(|sym| {
+                            matches!(sym.kind, SymbolKind::Function | SymbolKind::Method)
+                        })
+                    {
+                        self.sets.reads.insert(path);
+                    }
                     if let Some(args) = node.child_by_field(Field::Arguments) {
                         pending.push(args);
                     }
@@ -172,82 +157,32 @@ impl Walker<'_> {
             Kind::MemberExpression => flatten_member(node)?,
             _ => return None,
         };
-        // Expand a `This` anchor to the enclosing group before resolution, exactly
-        // as the evaluator does.
-        let rewritten = rewrite_this(&raw, self.group);
-        let path = rewritten.as_deref().unwrap_or(&raw);
-        match classify(path, self.group, self.fn_symbol, self.project, &self.locals) {
-            Target::Symbol(p) => Some(p),
-            // Locals, builtins, and unresolved anchors are not project deps.
-            Target::Local(_) | Target::Builtin { .. } | Target::Unresolved => None,
+        let scope = Scope {
+            locals: self
+                .locals
+                .iter()
+                .map(|name| (name.clone(), ValueType::Unknown))
+                .collect(),
+            group: self.group.map(str::to_string),
+            project: Some(self.project),
+            fn_symbol: self.fn_symbol.map(str::to_string),
+        };
+        match resolve(&raw, &scope) {
+            Resolution::Symbol(sym) => Some(sym.path.clone()),
+            _ => None,
         }
     }
 }
 
-/// What an identifier (or dotted path) denotes. A `Value`-free port of
-/// `m1-eval/src/ident.rs`'s `Target` — the walker only distinguishes "is it a
-/// project symbol" from "is it a local/builtin/miss", so no runtime value is
-/// carried.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Target {
-    /// A project channel/parameter/constant/table/function, by its single
-    /// canonical symbol-table path (e.g. `"Root.Demo.Speed"`).
-    Symbol(String),
-    /// A function-local variable, by its name.
-    Local(String),
-    /// A builtin library object (e.g. `Calculate`). `object` is the library
-    /// object name.
-    Builtin { object: String },
-    /// Nothing in the project, locals, or the builtin library matches.
-    Unresolved,
-}
-
-/// The leading dot-segment of a path (`"Calculate"` of `"Calculate.Max"`). Never
-/// splits on whitespace — only on `.`.
-fn root_segment(path: &str) -> &str {
-    match path.find('.') {
-        Some(i) => &path[..i],
-        None => path,
+fn return_value_is_used(node: &Node) -> bool {
+    let mut parent = node.parent();
+    while let Some(node) = parent {
+        if node.kind() != Kind::ParenthesizedExpression {
+            return node.kind() != Kind::ExpressionStatement;
+        }
+        parent = node.parent();
     }
-}
-
-/// Classify an identifier/path against the project, the enclosing group, the
-/// backing function symbol, and the current function locals. Ported from
-/// `m1-eval/src/ident.rs::classify`, with `locals` as a name set (their runtime
-/// values are irrelevant to resolution, so they resolve as `ValueType::Unknown`).
-fn classify(
-    name: &str,
-    group: Option<&str>,
-    fn_symbol: Option<&str>,
-    project: &Project,
-    locals: &HashSet<String>,
-) -> Target {
-    let scope = Scope {
-        locals: locals
-            .iter()
-            .map(|k| (k.clone(), ValueType::Unknown))
-            .collect(),
-        group: group.map(str::to_string),
-        project: Some(project),
-        fn_symbol: fn_symbol.map(str::to_string),
-    };
-
-    match resolve(name, &scope) {
-        Resolution::Symbol(sym) => Target::Symbol(sym.path.clone()),
-        Resolution::Local(_) => Target::Local(name.to_string()),
-        Resolution::BuiltinObject(obj) => Target::Builtin {
-            object: obj.to_string(),
-        },
-        // A builtin function/method call (`Calculate.Max`). Its object is the
-        // leading segment.
-        Resolution::BuiltinFn(_) => Target::Builtin {
-            object: root_segment(name).to_string(),
-        },
-        // `Opaque` covers `In`/`Out`/`Parent`/`This`/`Library`/`Root` anchors and
-        // accessor calls; `This` is rewritten before this call, so reaching here
-        // means "no canonical symbol": treat as unresolved (not a project dep).
-        Resolution::Opaque | Resolution::Unresolved => Target::Unresolved,
-    }
+    false
 }
 
 /// Flatten a member chain without recursing over its depth. Each segment is
@@ -265,21 +200,6 @@ fn flatten_member(node: &Node) -> Option<String> {
         path.push_str(segment);
     }
     Some(path)
-}
-
-/// Rewrite a leading `This` anchor to the enclosing group's canonical path
-/// (`This.Output` from group `Root.Demo` → `Root.Demo.Output`; bare `This` →
-/// `Root.Demo`). `resolve` handles the `In`/`Out`/`Parent`/`Root` anchors itself
-/// but not `This`, so we expand it here before classification. Only `.` splits
-/// segments, never whitespace. Non-`This` paths return `None` (caller falls back
-/// to the original). Ported verbatim from `m1-eval/src/expr.rs::rewrite_this`.
-fn rewrite_this(path: &str, group: Option<&str>) -> Option<String> {
-    let group = group?;
-    if path == "This" {
-        return Some(group.to_string());
-    }
-    path.strip_prefix("This.")
-        .map(|rest| format!("{group}.{rest}"))
 }
 
 #[cfg(test)]
@@ -314,6 +234,67 @@ mod tests {
     fn script_from(src: &str) -> ParsedScript {
         let pairs = vec![("Demo.Update.m1scr".to_string(), src.to_string())];
         parse_all(&pairs).into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn project_return_calls_resolve_without_builtin_or_effect_guesses() {
+        let extra = r#"
+   <Component Classname="BuiltIn.FuncUserParam" Filename="Demo.Helper.m1scr" Name="Root.Demo.Helper"><Signature ReturnType="f32"><Params/></Signature></Component>
+   <Component Classname="BuiltIn.MethodUser" Filename="Demo.With Space.m1scr" Name="Root.Demo.With Space"><Signature ReturnType="f32"><Params/></Signature></Component>
+   <Component Classname="BuiltIn.FuncUserParam" Filename="Demo.Calculate.Max.m1scr" Name="Root.Demo.Calculate.Max"><Signature ReturnType="f32"><Params/></Signature></Component>
+"#;
+        let project =
+            Project::from_xml(&MINI_PROJECT.replace("</List>", &format!("{extra}</List>")))
+                .unwrap();
+        for name in [
+            "Helper",
+            "This.Helper",
+            "Root.Demo.Helper",
+            "Demo.Helper",
+            "Parent.Demo.Helper",
+        ] {
+            let sets = io_sets(
+                &script_from(&format!("Output = {name}(Speed);")),
+                &project,
+                Some("Root.Demo"),
+            );
+            assert_eq!(
+                sets.reads,
+                BTreeSet::from(["Root.Demo.Helper".into(), "Root.Demo.Speed".into()]),
+                "{name}"
+            );
+        }
+        let sets = io_sets(
+            &script_from("Output = This.With Space(Speed);"),
+            &project,
+            Some("Root.Demo"),
+        );
+        assert!(sets.reads.contains("Root.Demo.With Space"));
+        for body in [
+            "Helper(Speed);",
+            "(Helper(Speed));",
+            "Output = Calculate.Max(Speed, Gain);",
+            "Output = Library.Calculate.Max(Speed, Gain);",
+            "local Helper = 0; Output = Helper(Speed);",
+        ] {
+            let sets = io_sets(&script_from(body), &project, Some("Root.Demo"));
+            assert_eq!(
+                sets.reads
+                    .iter()
+                    .filter(|p| p.contains("Helper") || p.contains("Calculate"))
+                    .count(),
+                0,
+                "{body}: {sets:?}"
+            );
+            assert!(sets.reads.contains("Root.Demo.Speed"));
+        }
+        // The project anchor disambiguates a project member from the library.
+        let sets = io_sets(
+            &script_from("Output = This.Calculate.Max(Speed);"),
+            &project,
+            Some("Root.Demo"),
+        );
+        assert!(sets.reads.contains("Root.Demo.Calculate.Max"));
     }
 
     #[test]

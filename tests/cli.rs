@@ -629,3 +629,216 @@ fn fixture_project_exists() {
         overlay_log_file().display()
     );
 }
+
+fn copy_overlay_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let source = overlay_project().parent().unwrap().to_path_buf();
+    std::fs::create_dir(dir.path().join("Scripts")).unwrap();
+    for name in [
+        "Project.m1prj",
+        "parameters.m1cfg",
+        "scenario.toml",
+        "run.csv",
+        "Scripts/Demo.Update.m1scr",
+    ] {
+        std::fs::copy(source.join(name), dir.path().join(name)).unwrap();
+    }
+    dir
+}
+
+fn export_copy(dir: &Path, out: &Path) -> Command {
+    let mut command = Command::cargo_bin("m1-visualiser").unwrap();
+    command
+        .arg("--project")
+        .arg(dir.join("Project.m1prj"))
+        .args(["--format", "json", "--out"])
+        .arg(out);
+    command
+}
+
+#[test]
+fn cli_rejects_every_loaded_input_and_hardlink_alias() {
+    for name in [
+        "Project.m1prj",
+        "parameters.m1cfg",
+        "Scripts/Demo.Update.m1scr",
+        "scenario.toml",
+        "run.csv",
+    ] {
+        for hardlink in [false, true] {
+            let dir = copy_overlay_fixture();
+            let input = dir.path().join(name);
+            let before = std::fs::read(&input).unwrap();
+            let out = if hardlink {
+                let out = dir.path().join("alias.json");
+                std::fs::hard_link(&input, &out).unwrap();
+                out
+            } else {
+                input.clone()
+            };
+            let mut command = export_copy(dir.path(), &out);
+            if name == "scenario.toml" {
+                command.arg("--overlay-scenario").arg(&input);
+            } else if name == "run.csv" {
+                command.arg("--overlay-log").arg(&input);
+            }
+            let result = command.assert().failure().code(1);
+            assert!(
+                String::from_utf8_lossy(&result.get_output().stderr)
+                    .contains("output aliases input"),
+                "{name}: {result:?}"
+            );
+            assert_eq!(std::fs::read(&input).unwrap(), before, "{name}");
+            assert_eq!(std::fs::read(&out).unwrap(), before, "{name}");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_default_and_explicit_symlinks_preserve_inputs() {
+    for default in [false, true] {
+        let dir = copy_overlay_fixture();
+        let input = dir.path().join(if default {
+            "Project.m1prj"
+        } else {
+            "Scripts/Demo.Update.m1scr"
+        });
+        let before = std::fs::read(&input).unwrap();
+        let out = dir.path().join(if default {
+            "m1-graph.html"
+        } else {
+            "graph.json"
+        });
+        std::os::unix::fs::symlink(&input, &out).unwrap();
+        let mut command = if default {
+            let mut c = Command::cargo_bin("m1-visualiser").unwrap();
+            c.current_dir(dir.path()).env_remove("M1_PROJECT");
+            c
+        } else {
+            export_copy(dir.path(), &out)
+        };
+        let result = command.assert().failure().code(1);
+        assert!(
+            String::from_utf8_lossy(&result.get_output().stderr)
+                .contains("output must be a regular file")
+        );
+        assert_eq!(std::fs::read(&input).unwrap(), before);
+        assert!(std::fs::symlink_metadata(&out).unwrap().is_symlink());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_unreadable_script_or_directory_fails_without_replacing_output() {
+    use std::os::unix::fs::PermissionsExt;
+    for name in ["Scripts/Demo.Update.m1scr", "Scripts"] {
+        let dir = copy_overlay_fixture();
+        let source = dir.path().join(name);
+        let old_mode = std::fs::metadata(&source).unwrap().permissions();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o0)).unwrap();
+        let denied = if source.is_dir() {
+            std::fs::read_dir(&source).is_err()
+        } else {
+            std::fs::read(&source).is_err()
+        };
+        if !denied {
+            std::fs::set_permissions(&source, old_mode).unwrap();
+            eprintln!("permission denial requires an unprivileged runner");
+            continue;
+        }
+        let out = dir.path().join("graph.json");
+        std::fs::write(&out, "previous graph").unwrap();
+        let result = export_copy(dir.path(), &out).output().unwrap();
+        std::fs::set_permissions(&source, old_mode).unwrap();
+        assert_eq!(result.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&result.stderr).contains(&source.display().to_string()));
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "previous graph");
+    }
+}
+
+#[test]
+fn cli_ambiguous_used_scripts_fail_without_replacing_output() {
+    let dir = copy_overlay_fixture();
+    std::fs::create_dir(dir.path().join("backup")).unwrap();
+    std::fs::write(
+        dir.path().join("backup/Demo.Update.m1scr"),
+        "Speed = Output;",
+    )
+    .unwrap();
+    let out = dir.path().join("graph.json");
+    std::fs::write(&out, "previous graph").unwrap();
+    let result = export_copy(dir.path(), &out).assert().failure().code(1);
+    let error = String::from_utf8_lossy(&result.get_output().stderr);
+    assert!(error.contains("ambiguous script Demo.Update.m1scr"));
+    assert!(
+        error.contains(
+            &dir.path()
+                .join("backup/Demo.Update.m1scr")
+                .display()
+                .to_string()
+        )
+    );
+    assert!(
+        error.contains(
+            &dir.path()
+                .join("Scripts/Demo.Update.m1scr")
+                .display()
+                .to_string()
+        )
+    );
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "previous graph");
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_failed_atomic_write_keeps_the_previous_output() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = copy_overlay_fixture();
+    let output_dir = dir.path().join("output");
+    std::fs::create_dir(&output_dir).unwrap();
+    let out = output_dir.join("graph.json");
+    std::fs::write(&out, "previous graph").unwrap();
+    let old_mode = std::fs::metadata(&output_dir).unwrap().permissions();
+    std::fs::set_permissions(&output_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // Check the runner's privilege before testing, rather than accepting a
+    // successful export that could itself be the truncation regression.
+    let probe = output_dir.join("permission-probe");
+    if std::fs::File::create(&probe).is_ok() {
+        std::fs::set_permissions(&output_dir, old_mode).unwrap();
+        std::fs::remove_file(probe).unwrap();
+        eprintln!("write permission denial requires an unprivileged runner");
+        return;
+    }
+    let result = export_copy(dir.path(), &out).output().unwrap();
+    std::fs::set_permissions(&output_dir, old_mode).unwrap();
+    assert_eq!(result.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "previous graph");
+    assert_eq!(std::fs::read_dir(&output_dir).unwrap().count(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_refuses_symlinked_sources_before_an_overlay_can_read_untracked_inputs() {
+    for directory in [false, true] {
+        let dir = copy_overlay_fixture();
+        let external = tempfile::tempdir().unwrap();
+        let script = external.path().join("Demo.Update.m1scr");
+        std::fs::write(&script, "Output = Speed;").unwrap();
+        let source = dir
+            .path()
+            .join(if directory { "linked" } else { "Alias.m1scr" });
+        std::os::unix::fs::symlink(if directory { external.path() } else { &script }, &source)
+            .unwrap();
+        let mut command = export_copy(dir.path(), &script);
+        command
+            .arg("--overlay-scenario")
+            .arg(dir.path().join("scenario.toml"));
+        let result = command.assert().failure().code(1);
+        assert!(
+            String::from_utf8_lossy(&result.get_output().stderr)
+                .contains("symlinked project sources are unsupported")
+        );
+        assert_eq!(std::fs::read_to_string(script).unwrap(), "Output = Speed;");
+    }
+}
