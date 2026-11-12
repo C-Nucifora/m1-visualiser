@@ -101,7 +101,10 @@ fn resolve_config(arg: Option<PathBuf>, project_path: &std::path::Path) -> Optio
     if let Some(p) = arg {
         return Some(p);
     }
-    let dir = project_path.parent()?;
+    let dir = project_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let mut found: Option<PathBuf> = None;
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let path = entry.path();

@@ -116,7 +116,10 @@ pub fn load(
 
     // Discover scripts relative to the project file's directory (mirrors m1-doc
     // and m1-eval's loader), parsing each `.m1scr` exactly once.
-    let project_dir = project_path.parent().unwrap_or_else(|| Path::new("."));
+    let project_dir = project_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let pairs = collect_scripts(project_dir);
     let scripts = parse_all(&pairs);
 
@@ -142,9 +145,13 @@ fn collect_scripts_rec(dir: &Path, out: &mut Vec<(String, String)>) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
             collect_scripts_rec(&path, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("m1scr") {
+        } else if file_type.is_file() && path.extension().and_then(|e| e.to_str()) == Some("m1scr")
+        {
             let Some(name) = path
                 .file_name()
                 .and_then(|n| n.to_str())
