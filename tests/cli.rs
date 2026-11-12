@@ -736,7 +736,7 @@ fn cli_unreadable_script_or_directory_fails_without_replacing_output() {
         let dir = copy_overlay_fixture();
         let source = dir.path().join(name);
         let old_mode = std::fs::metadata(&source).unwrap().permissions();
-        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o0)).unwrap();
         let denied = if source.is_dir() {
             std::fs::read_dir(&source).is_err()
         } else {

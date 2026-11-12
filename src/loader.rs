@@ -916,7 +916,8 @@ mod tests {
         let script = dir.path().join("Limiter.m1scr");
         // A file disappearing after enumeration is a deterministic read failure.
         let project = Project::from_xml(DATAFLOW_PROJECT).unwrap();
-        let error = collect_scripts(&project, dir.path(), &[script.clone()]).unwrap_err();
+        let error =
+            collect_scripts(&project, dir.path(), std::slice::from_ref(&script)).unwrap_err();
         assert!(error.to_string().contains(&script.display().to_string()));
     }
 
