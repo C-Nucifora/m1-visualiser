@@ -10,6 +10,8 @@ use m1_visualiser::{dot, html, json, loader};
 use std::path::{Path, PathBuf};
 use std::process;
 
+mod output;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "m1-visualiser",
@@ -97,26 +99,33 @@ fn resolve_project(arg: Option<PathBuf>) -> Option<PathBuf> {
 /// Resolve the config path: explicit `--config` wins. Otherwise discover a
 /// single sibling `*.m1cfg` next to the project; if zero or several exist the
 /// result is `None` (conservative — ambiguity never guesses).
-fn resolve_config(arg: Option<PathBuf>, project_path: &std::path::Path) -> Option<PathBuf> {
+fn resolve_config(
+    arg: Option<PathBuf>,
+    project_path: &std::path::Path,
+) -> std::io::Result<Option<PathBuf>> {
     if let Some(p) = arg {
-        return Some(p);
+        return Ok(Some(p));
     }
     let dir = project_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let mut found: Option<PathBuf> = None;
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        let path = entry.path();
+    for entry in std::fs::read_dir(dir)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", dir.display())))?
+    {
+        let path = entry
+            .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", dir.display())))?
+            .path();
         if path.extension().and_then(|e| e.to_str()) == Some("m1cfg") {
             if found.is_some() {
                 // More than one sibling cfg: ambiguous, so use none.
-                return None;
+                return Ok(None);
             }
             found = Some(path);
         }
     }
-    found
+    Ok(found)
 }
 
 /// The overlay-flag inputs, grouped so the guard + dispatch logic lives in one
@@ -221,7 +230,13 @@ fn main() {
         process::exit(2);
     };
 
-    let config_path = resolve_config(args.config, &project_path);
+    let config_path = match resolve_config(args.config, &project_path) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("m1-visualiser: {error}");
+            process::exit(1);
+        }
+    };
 
     let title = args.title.or_else(|| {
         project_path
@@ -230,13 +245,14 @@ fn main() {
             .map(|n| n.to_string_lossy().into_owned())
     });
 
-    let model = match loader::load(&project_path, config_path.as_deref(), title) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("m1-visualiser: {}: {e}", project_path.display());
-            process::exit(1);
-        }
-    };
+    let (model, mut inputs) =
+        match loader::load_with_inputs(&project_path, config_path.as_deref(), title) {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                eprintln!("m1-visualiser: {}: {e}", project_path.display());
+                process::exit(1);
+            }
+        };
 
     // Optionally compute and fold an overlay onto the structural model. With no
     // overlay flag this is a no-op and the render below is byte-for-byte the v1
@@ -267,7 +283,9 @@ fn main() {
         .out
         .unwrap_or_else(|| PathBuf::from(format!("m1-graph.{}", args.format.ext())));
 
-    if let Err(e) = std::fs::write(&out, rendered) {
+    inputs.extend(args.overlay_scenario);
+    inputs.extend(args.overlay_log);
+    if let Err(e) = output::write(&out, rendered.as_bytes(), &inputs) {
         eprintln!("m1-visualiser: {}: {e}", out.display());
         process::exit(1);
     }

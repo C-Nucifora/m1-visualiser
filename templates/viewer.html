@@ -438,7 +438,7 @@ document.addEventListener("DOMContentLoaded", function () {
     var seenNodes = cy.collection();
     var seenEdges = cy.collection();
     var frontier = [start];
-    var visited = {};
+    var visited = Object.create(null);
     visited[start.id()] = true;
     while (frontier.length > 0) {
       var node = frontier.shift();
@@ -557,6 +557,7 @@ document.addEventListener("DOMContentLoaded", function () {
         var base = n.data("label") || "";
         if (base.indexOf("ext") === -1) { n.data("label", base + "\next"); }
       }
+      n.data("ovBaseLabel", n.data("label") || "");
     });
 
     // Apply the overlay at tick `i`: colour/size each numeric node from its cell,
@@ -570,11 +571,13 @@ document.addEventListener("DOMContentLoaded", function () {
         var cell = (no.series || [])[i];
         if (!cell) { return; }
         if (typeof cell.num === "number") {
+          n.data("label", n.data("ovBaseLabel"));
           n.removeClass("overlay-label");
           n.data("ovColor", valueColor(cell.num));
           n.data("ovSize", valueSize(cell.num));
           n.addClass("overlay-num");
         } else {
+          n.data("label", n.data("ovBaseLabel") + "\n" + cellText(cell));
           n.removeClass("overlay-num");
           n.addClass("overlay-label");
         }
@@ -582,6 +585,7 @@ document.addEventListener("DOMContentLoaded", function () {
       var t = time[i];
       var label = document.getElementById("time-readout");
       if (label) { label.textContent = "t = " + (t != null ? t : i); }
+      if (searchInput && searchInput.value.trim()) { applySearch(); }
       if (selectedNode) { nodeReadout(selectedNode); }
     }
 

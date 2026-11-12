@@ -32,7 +32,8 @@ use m1_typecheck::parsed::{ParsedScript, parse_all};
 use m1_typecheck::symbols::{Symbol, SymbolKind};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 
 /// Map an `m1-typecheck` symbol kind to a [`NodeKind`]. Returns `None` for kinds
 /// the structural graph does not surface as nodes (references, opaque objects,
@@ -106,64 +107,140 @@ pub fn load(
     config_path: Option<&Path>,
     title: Option<String>,
 ) -> Result<GraphModel, m1_typecheck::project::LoadError> {
-    let mut project = Project::load(project_path)?;
+    load_with_inputs(project_path, config_path, title).map(|(model, _)| model)
+}
 
-    // Augment the project with the cfg's table/parameter shape if provided. This
-    // is what populates `Symbol::table_meta`, used for `table_dims`.
+/// Load a graph and retain the input paths for an output-alias guard.
+///
+/// Includes discovered scripts and CAN sources, since scenario/diff evaluation
+/// also reads CAN sources. Symlinked source files/directories are rejected so
+/// the structural loader and evaluator cannot read different input sets.
+pub fn load_with_inputs(
+    project_path: &Path,
+    config_path: Option<&Path>,
+    title: Option<String>,
+) -> Result<(GraphModel, Vec<PathBuf>), m1_typecheck::project::LoadError> {
+    use m1_typecheck::project::LoadError;
+    let mut project = Project::load(project_path)?;
     if let Some(cfg) = config_path {
         project = project.with_config(cfg)?;
     }
-
-    // Discover scripts relative to the project file's directory (mirrors m1-doc
-    // and m1-eval's loader), parsing each `.m1scr` exactly once.
     let project_dir = project_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let pairs = collect_scripts(project_dir);
+    let mut inputs = Vec::new();
+    collect_files(project_dir, &mut inputs).map_err(LoadError::Io)?;
+    inputs.sort();
+    let pairs = collect_scripts(&project, project_dir, &inputs).map_err(LoadError::Io)?;
     let scripts = parse_all(&pairs);
-
-    Ok(build_model_with_scripts(&project, &scripts, title))
+    inputs.push(project_path.to_path_buf());
+    inputs.extend(config_path.map(Path::to_path_buf));
+    Ok((build_model_with_scripts(&project, &scripts, title), inputs))
 }
 
-/// Collect every `.m1scr` under `dir` (recursively) as `(basename, source)`
-/// pairs, sorted deterministically by basename. Sources are lossy-UTF-8 decoded
-/// so Windows-1252 exports do not abort discovery. Ported from
-/// `m1-eval/src/loader.rs` (same project, GPL-3.0-or-later).
-fn collect_scripts(dir: &Path) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    collect_scripts_rec(dir, &mut out);
-    // Deterministic order: sort by basename so the graph (and any traces) are
-    // reproducible regardless of filesystem enumeration order.
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
+fn path_error(path: &Path, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{}: {error}", path.display()))
 }
 
-fn collect_scripts_rec(dir: &Path, out: &mut Vec<(String, String)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
+    let entries = std::fs::read_dir(dir).map_err(|e| path_error(dir, e))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| path_error(dir, e))?;
         let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_dir() {
-            collect_scripts_rec(&path, out);
-        } else if file_type.is_file() && path.extension().and_then(|e| e.to_str()) == Some("m1scr")
-        {
-            let Some(name) = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(str::to_string)
-            else {
-                continue;
+        let file_type = entry.file_type().map_err(|e| path_error(&path, e))?;
+        if file_type.is_symlink() {
+            let source = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|ext| ext == "m1scr" || ext.eq_ignore_ascii_case("m1dbc"));
+            // The evaluator follows script/directory symlinks. Refuse those
+            // rather than let an overlay read inputs the alias guard cannot see.
+            let directory = match std::fs::metadata(&path) {
+                Ok(meta) => meta.is_dir(),
+                Err(e) if e.kind() == io::ErrorKind::NotFound && !source => false,
+                Err(e) => return Err(path_error(&path, e)),
             };
-            let bytes = std::fs::read(&path).unwrap_or_default();
-            let source = String::from_utf8_lossy(&bytes).into_owned();
-            out.push((name, source));
+            if source || directory {
+                return Err(path_error(
+                    &path,
+                    io::Error::other("symlinked project sources are unsupported"),
+                ));
+            }
+        }
+        if file_type.is_dir() {
+            collect_files(&path, out)?;
+        } else if file_type.is_file()
+            && path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|ext| ext == "m1scr" || ext.eq_ignore_ascii_case("m1dbc"))
+        {
+            out.push(path);
         }
     }
+    Ok(())
+}
+
+/// Read sources without substituting empty text on failure. A project's explicit
+/// relative Filename selects that exact path; a bare name must be unique.
+fn collect_scripts(
+    project: &Project,
+    dir: &Path,
+    paths: &[PathBuf],
+) -> io::Result<Vec<(String, String)>> {
+    let mut sources = Vec::new();
+    for path in paths {
+        if path.extension().and_then(|e| e.to_str()) == Some("m1scr") {
+            let bytes = std::fs::read(path).map_err(|e| path_error(path, e))?;
+            sources.push((path, String::from_utf8_lossy(&bytes).into_owned()));
+        }
+    }
+    let names: BTreeSet<String> = project
+        .symbols()
+        .iter()
+        .filter(|sym| matches!(sym.kind, SymbolKind::Function | SymbolKind::Method))
+        .filter_map(|sym| {
+            sym.filename.clone().or_else(|| {
+                sym.path
+                    .strip_prefix("Root.")
+                    .map(|stem| format!("{stem}.m1scr"))
+            })
+        })
+        .collect();
+    let mut pairs = Vec::new();
+    for name in names {
+        // Keep the project's key for group_for_script/function_symbol_for_script.
+        if project.function_symbol_for_script(&name).is_none() {
+            continue;
+        }
+        let relative = dir.join(name.replace('\\', "/"));
+        let matches: Vec<_> = sources
+            .iter()
+            .filter(|(path, _)| {
+                if name.contains(['/', '\\']) {
+                    **path == relative
+                } else {
+                    path.file_name().and_then(|n| n.to_str()) == Some(name.as_str())
+                }
+            })
+            .collect();
+        if matches.len() > 1 {
+            let mut paths: Vec<_> = matches
+                .iter()
+                .map(|(path, _)| path.display().to_string())
+                .collect();
+            paths.sort();
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("ambiguous script {name}: {}", paths.join(", ")),
+            ));
+        }
+        if let Some((_, source)) = matches.first() {
+            pairs.push((name, source.clone()));
+        }
+    }
+    Ok(pairs)
 }
 
 /// Build the structural graph model from an already-loaded project, with no
@@ -739,6 +816,51 @@ mod tests {
     }
 
     #[test]
+    fn return_call_chains_and_cycles_preserve_the_upstream_cone() {
+        let extra = r#"
+   <Component Classname="BuiltIn.FuncUserParam" Filename="Helper.m1scr" Name="Root.Engine.Helper"><Signature ReturnType="f32"><Params/></Signature></Component>
+   <Component Classname="BuiltIn.FuncUserParam" Filename="Leaf.m1scr" Name="Root.Engine.Leaf"><Signature ReturnType="f32"><Params/></Signature></Component>
+"#;
+        let project =
+            Project::from_xml(&DATAFLOW_PROJECT.replace("</List>", &format!("{extra}</List>")))
+                .unwrap();
+        for recursive in [false, true] {
+            let scripts = vec![
+                script_named("Limiter.m1scr", "Limited = Calculate.Max(Helper(), 1);"),
+                script_named("Helper.m1scr", "Out = Leaf();"),
+                script_named(
+                    "Leaf.m1scr",
+                    if recursive {
+                        "Out = Speed + Helper();"
+                    } else {
+                        "Out = Speed;"
+                    },
+                ),
+            ];
+            let model = build_model_with_scripts(&project, &scripts, None);
+            let mut seen = BTreeSet::new();
+            let mut pending = vec!["Root.Engine.Limited".to_string()];
+            while let Some(id) = pending.pop() {
+                if seen.insert(id.clone()) {
+                    pending.extend(
+                        model
+                            .edges
+                            .iter()
+                            .filter(|e| e.kind == EdgeKind::DataFlow && e.to == id)
+                            .map(|e| e.from.clone()),
+                    );
+                }
+                assert!(seen.len() <= model.nodes.len());
+            }
+            for name in ["Speed", "Leaf", "Helper", "Limiter", "Limited"] {
+                assert!(seen.contains(&format!("Root.Engine.{name}")), "{seen:?}");
+            }
+            assert!(!model.edges.iter().any(|e| e.from.contains("Calculate")));
+            assert_eq!(model, build_model_with_scripts(&project, &scripts, None));
+        }
+    }
+
+    #[test]
     fn data_flow_edges_skip_unknown_endpoints() {
         // A read whose canonical path is a builtin (`Calculate.Max`) and a write
         // to a channel that is not a graph node must produce no data-flow edge:
@@ -773,31 +895,81 @@ mod tests {
     }
 
     #[test]
-    fn collect_scripts_finds_m1scr() {
-        // A project dir with one `.m1scr` should yield exactly one parsed script
-        // with the right name and a non-empty source.
-        let dir = tempfile::tempdir().expect("temp dir");
-        let prj = dir.path().join("Project.m1prj");
-        std::fs::write(&prj, TABLE_PROJECT).expect("write project");
-        let scr = dir.path().join("Update.m1scr");
-        std::fs::write(&scr, "Output = 1;\n").expect("write script");
+    fn collect_scripts_finds_used_m1scr_and_allows_empty_source() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Project.m1prj"), DATAFLOW_PROJECT).unwrap();
+        std::fs::write(dir.path().join("Limiter.m1scr"), "").unwrap();
+        let mut paths = Vec::new();
+        collect_files(dir.path(), &mut paths).unwrap();
+        let project = Project::from_xml(DATAFLOW_PROJECT).unwrap();
+        let pairs = collect_scripts(&project, dir.path(), &paths).unwrap();
+        assert_eq!(pairs, vec![("Limiter.m1scr".into(), "".into())]);
+        assert!(load(&dir.path().join("Project.m1prj"), None, None).is_ok());
+    }
 
-        let pairs = collect_scripts(dir.path());
-        assert_eq!(
-            pairs.len(),
-            1,
-            "exactly one .m1scr discovered; got {pairs:?}"
+    #[test]
+    fn discovery_and_read_errors_keep_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let error = collect_files(&missing, &mut Vec::new()).unwrap_err();
+        assert!(error.to_string().contains(&missing.display().to_string()));
+        let script = dir.path().join("Limiter.m1scr");
+        // A file disappearing after enumeration is a deterministic read failure.
+        let project = Project::from_xml(DATAFLOW_PROJECT).unwrap();
+        let error = collect_scripts(&project, dir.path(), &[script.clone()]).unwrap_err();
+        assert!(error.to_string().contains(&script.display().to_string()));
+    }
+
+    #[test]
+    fn duplicate_used_basenames_fail_deterministically() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = Project::from_xml(DATAFLOW_PROJECT).unwrap();
+        let mut paths = Vec::new();
+        for sub in ["scripts", "backup"] {
+            std::fs::create_dir(dir.path().join(sub)).unwrap();
+            let path = dir.path().join(sub).join("Limiter.m1scr");
+            std::fs::write(
+                &path,
+                if sub == "backup" {
+                    "Speed = Limited;"
+                } else {
+                    "Limited = Speed;"
+                },
+            )
+            .unwrap();
+            paths.push(path);
+        }
+        let first = collect_scripts(&project, dir.path(), &paths)
+            .unwrap_err()
+            .to_string();
+        paths.reverse();
+        let second = collect_scripts(&project, dir.path(), &paths)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(first, second);
+        assert!(first.contains("ambiguous script Limiter.m1scr"));
+        assert!(first.contains("backup"));
+        assert!(first.contains("scripts"));
+    }
+
+    #[test]
+    fn explicit_relative_filename_selects_its_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let xml = DATAFLOW_PROJECT.replace(
+            "Filename=\"Limiter.m1scr\"",
+            "Filename=\"scripts/Limiter.m1scr\"",
         );
-        assert_eq!(pairs[0].0, "Update.m1scr", "discovered by basename");
-        assert!(!pairs[0].1.is_empty(), "source should be non-empty");
-
-        // And the same discovery, parsed, surfaces through the public loader.
-        let scripts = parse_all(&pairs);
-        assert_eq!(scripts.len(), 1, "one parsed script");
-        assert_eq!(scripts[0].name, "Update.m1scr");
-        assert!(
-            !scripts[0].cst.source().is_empty(),
-            "parsed CST should retain its source"
+        let project = Project::from_xml(&xml).unwrap();
+        let mut paths = Vec::new();
+        for sub in ["scripts", "backup"] {
+            std::fs::create_dir(dir.path().join(sub)).unwrap();
+            let path = dir.path().join(sub).join("Limiter.m1scr");
+            std::fs::write(&path, sub).unwrap();
+            paths.push(path);
+        }
+        assert_eq!(
+            collect_scripts(&project, dir.path(), &paths).unwrap(),
+            vec![("scripts/Limiter.m1scr".into(), "scripts".into())]
         );
     }
 
