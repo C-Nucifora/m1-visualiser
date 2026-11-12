@@ -46,8 +46,9 @@ pub(crate) fn write(path: &Path, contents: &[u8], inputs: &[std::path::PathBuf])
     if let Some(meta) = &metadata {
         use std::os::unix::fs::PermissionsExt;
         // Creation applies umask; replacing a file must retain its existing mode.
-        temp.as_file()
-            .set_permissions(fs::Permissions::from_mode(meta.permissions().mode() & 0o777))?;
+        temp.as_file().set_permissions(fs::Permissions::from_mode(
+            meta.permissions().mode() & 0o777,
+        ))?;
     }
     temp.write_all(contents)?;
     temp.flush()?;
@@ -118,7 +119,10 @@ mod tests {
             fs::write(&out, "old").unwrap();
             fs::set_permissions(&out, fs::Permissions::from_mode(mode)).unwrap();
             write(&out, b"new", &[]).unwrap();
-            assert_eq!(fs::metadata(&out).unwrap().permissions().mode() & 0o777, mode);
+            assert_eq!(
+                fs::metadata(&out).unwrap().permissions().mode() & 0o777,
+                mode
+            );
             assert_eq!(fs::read(&out).unwrap(), b"new");
         }
     }
